@@ -1,0 +1,385 @@
+name: Batch Fork Repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '是否为试运行模式'
+        required: false
+        default: 'false'
+        type: boolean
+      download_latest:
+        description: '是否下载最新的 plugins.json'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  batch-fork:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Install dependencies
+      run: |
+        npm install @octokit/rest
+        npm install fs-extra
+        
+    - name: Batch Fork Script
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        DOWNLOAD_LATEST: ${{ inputs.download_latest }}
+      run: |
+        node -e "
+        const { Octokit } = require('@octokit/rest');
+        const fs = require('fs-extra');
+        const path = require('path');
+        const https = require('https');
+        
+        // 初始化 Octokit
+        const octokit = new Octokit({
+          auth: process.env.GITHUB_TOKEN,
+        });
+        
+        // 下载最新的 plugins.json
+        async function downloadLatestPluginsJson() {
+          return new Promise((resolve, reject) => {
+            const url = 'https://raw.githubusercontent.com/AstrBotDevs/AstrBot_Plugins_Collection/main/plugins.json';
+            
+            https.get(url, (response) => {
+              let data = '';
+              
+              response.on('data', (chunk) => {
+                data += chunk;
+              });
+              
+              response.on('end', () => {
+                try {
+                  const pluginsJson = JSON.parse(data);
+                  resolve(pluginsJson);
+                } catch (error) {
+                  reject(new Error(\`Failed to parse plugins.json: \${error.message}\`));
+                }
+              });
+            }).on('error', (error) => {
+              reject(new Error(\`Failed to download plugins.json: \${error.message}\`));
+            });
+          });
+        }
+        
+        // 获取当前用户信息
+        async function getCurrentUser() {
+          const { data: user } = await octokit.rest.users.getAuthenticated();
+          return user.login;
+        }
+        
+        // 从 AstrBot plugins.json 提取仓库地址
+        function extractRepoUrls(pluginJson) {
+          const repoUrls = [];
+          
+          // AstrBot plugins.json 结构: { "插件名": { "repo": "github地址", "desc": "描述", "author": "作者", ... } }
+          for (const pluginName in pluginJson) {
+            const pluginInfo = pluginJson[pluginName];
+            
+            if (pluginInfo && typeof pluginInfo === 'object' && pluginInfo.repo) {
+              let repoUrl = pluginInfo.repo;
+              
+              // 处理不同格式的仓库地址
+              if (typeof repoUrl === 'string') {
+                // 提取 GitHub 仓库路径
+                let repoPath = null;
+                
+                // 处理完整的 GitHub URL
+                if (repoUrl.includes('github.com')) {
+                  const match = repoUrl.match(/github\.com\/([^\/]+\/[^\/]+)/);
+                  if (match) {
+                    repoPath = match[1].replace(/\.git$/, '').replace(/\/$/, '');
+                  }
+                }
+                // 处理简短格式 owner/repo
+                else if (repoUrl.match(/^[^\/]+\/[^\/]+$/)) {
+                  repoPath = repoUrl;
+                }
+                
+                if (repoPath) {
+                  repoUrls.push({
+                    name: pluginName,
+                    repo: repoPath,
+                    description: pluginInfo.desc || '',
+                    author: pluginInfo.author || ''
+                  });
+                }
+              }
+            }
+          }
+          
+          // 去重（基于 repo 字段）
+          const uniqueRepos = [];
+          const seenRepos = new Set();
+          
+          for (const item of repoUrls) {
+            if (!seenRepos.has(item.repo)) {
+              seenRepos.add(item.repo);
+              uniqueRepos.push(item);
+            }
+          }
+          
+          return uniqueRepos;
+        }
+        
+        // 检查仓库是否已经fork过
+        async function checkIfForked(owner, repo, currentUser) {
+          try {
+            const { data: fork } = await octokit.rest.repos.get({
+              owner: currentUser,
+              repo: repo,
+            });
+            
+            // 检查是否为fork且parent指向目标仓库
+            if (fork.fork && fork.parent) {
+              return fork.parent.full_name === \`\${owner}/\${repo}\`;
+            }
+            return false;
+          } catch (error) {
+            if (error.status === 404) {
+              return false;
+            }
+            throw error;
+          }
+        }
+        
+        // Fork仓库（带重试机制）
+        async function forkRepository(owner, repo, currentUser, retries = 3) {
+          console.log(\`🍴 Forking \${owner}/\${repo}...\`);
+          
+          if (process.env.DRY_RUN === 'true') {
+            console.log(\`[DRY RUN] Would fork \${owner}/\${repo}\`);
+            return;
+          }
+          
+          for (let i = 0; i < retries; i++) {
+            try {
+              await octokit.rest.repos.createFork({
+                owner: owner,
+                repo: repo,
+              });
+              console.log(\`✅ Successfully forked \${owner}/\${repo}\`);
+              return;
+            } catch (error) {
+              if (error.status === 403 && error.message.includes('rate limit')) {
+                console.log(\`⏳ Rate limit hit for \${owner}/\${repo}, waiting 60 seconds...\`);
+                await delay(60000);
+                continue;
+              }
+              
+              if (error.status === 403 && error.message.includes('already exists')) {
+                console.log(\`ℹ️  Fork \${owner}/\${repo} already exists\`);
+                return;
+              }
+              
+              if (i === retries - 1) {
+                console.error(\`❌ Failed to fork \${owner}/\${repo} after \${retries} attempts: \${error.message}\`);
+                throw error;
+              }
+              
+              console.log(\`⚠️  Fork attempt \${i + 1} failed for \${owner}/\${repo}, retrying...\`);
+              await delay(5000);
+            }
+          }
+        }
+        
+        // 同步fork仓库（带重试机制）
+        async function syncFork(owner, repo, currentUser, retries = 3) {
+          console.log(\`🔄 Syncing fork \${currentUser}/\${repo}...\`);
+          
+          if (process.env.DRY_RUN === 'true') {
+            console.log(\`[DRY RUN] Would sync fork \${currentUser}/\${repo}\`);
+            return;
+          }
+          
+          for (let i = 0; i < retries; i++) {
+            try {
+              // 获取上游仓库的默认分支
+              const { data: upstream } = await octokit.rest.repos.get({
+                owner: owner,
+                repo: repo,
+              });
+              
+              // 同步fork
+              await octokit.rest.repos.mergeUpstream({
+                owner: currentUser,
+                repo: repo,
+                branch: upstream.default_branch,
+              });
+              
+              console.log(\`✅ Successfully synced fork \${currentUser}/\${repo}\`);
+              return;
+            } catch (error) {
+              if (error.status === 403 && error.message.includes('rate limit')) {
+                console.log(\`⏳ Rate limit hit for \${currentUser}/\${repo}, waiting 60 seconds...\`);
+                await delay(60000);
+                continue;
+              }
+              
+              if (error.status === 409) {
+                console.log(\`ℹ️  Fork \${currentUser}/\${repo} is already up to date\`);
+                return;
+              }
+              
+              if (error.status === 422) {
+                console.log(\`ℹ️  No commits between \${currentUser}/\${repo} and upstream\`);
+                return;
+              }
+              
+              if (i === retries - 1) {
+                console.error(\`❌ Failed to sync fork \${currentUser}/\${repo} after \${retries} attempts: \${error.message}\`);
+                throw error;
+              }
+              
+              console.log(\`⚠️  Sync attempt \${i + 1} failed for \${currentUser}/\${repo}, retrying...\`);
+              await delay(5000);
+            }
+          }
+        }
+        
+        // 延迟函数
+        function delay(ms) {
+          return new Promise(resolve => setTimeout(resolve, ms));
+        }
+        
+        // 分组处理
+        function chunk(array, size) {
+          const chunks = [];
+          for (let i = 0; i < array.length; i += size) {
+            chunks.push(array.slice(i, i + size));
+          }
+          return chunks;
+        }
+        
+        // 主函数
+        async function main() {
+          try {
+            console.log('🚀 开始批量fork操作...');
+            
+            let pluginJson;
+            
+            // 根据参数决定是否下载最新的 plugins.json
+            if (process.env.DOWNLOAD_LATEST === 'true') {
+              console.log('📥 下载最新的 plugins.json...');
+              try {
+                pluginJson = await downloadLatestPluginsJson();
+                console.log('✅ 成功下载最新的 plugins.json');
+              } catch (error) {
+                console.log(\`⚠️  下载失败，尝试使用本地文件: \${error.message}\`);
+                // 回退到本地文件
+                const pluginJsonPath = path.join(process.cwd(), 'plugins.json');
+                if (!fs.existsSync(pluginJsonPath)) {
+                  throw new Error('plugins.json 文件不存在，且无法下载最新版本');
+                }
+                pluginJson = await fs.readJson(pluginJsonPath);
+              }
+            } else {
+              // 使用本地文件
+              console.log('📁 使用本地 plugins.json...');
+              const pluginJsonPath = path.join(process.cwd(), 'plugins.json');
+              if (!fs.existsSync(pluginJsonPath)) {
+                throw new Error('plugins.json 文件不存在');
+              }
+              pluginJson = await fs.readJson(pluginJsonPath);
+            }
+            const repoInfos = extractRepoUrls(pluginJson);
+            
+            console.log(\`📋 找到 \${repoInfos.length} 个插件仓库:\`);
+            repoInfos.forEach((info, index) => {
+              console.log(\`  \${index + 1}. \${info.name} -> \${info.repo}\`);
+              if (info.description) {
+                console.log(\`     描述: \${info.description}\`);
+              }
+            });
+            
+            if (repoInfos.length === 0) {
+              console.log('⚠️  没有找到任何有效的GitHub仓库');
+              return;
+            }
+            
+            // 获取当前用户
+            const currentUser = await getCurrentUser();
+            console.log(\`👤 当前用户: \${currentUser}\`);
+            
+            // 分组处理（每组10个）
+            const groups = chunk(repoInfos, 10);
+            console.log(\`📦 分为 \${groups.length} 组处理\`);
+            
+            let totalProcessed = 0;
+            let totalForked = 0;
+            let totalSynced = 0;
+            let totalErrors = 0;
+            
+            for (let i = 0; i < groups.length; i++) {
+              const group = groups[i];
+              console.log(\`\\n📦 处理第 \${i + 1}/\${groups.length} 组 (共 \${group.length} 个仓库):\`);
+              
+              // 并发处理当前组
+              const groupPromises = group.map(async (repoInfo) => {
+                const [owner, repo] = repoInfo.repo.split('/');
+                
+                try {
+                  // 检查是否已经fork过
+                  const isForked = await checkIfForked(owner, repo, currentUser);
+                  
+                  if (isForked) {
+                    console.log(\`🔄 插件 \${repoInfo.name} (\${owner}/\${repo}) 已经fork过，执行同步...\`);
+                    await syncFork(owner, repo, currentUser);
+                    totalSynced++;
+                  } else {
+                    console.log(\`🆕 插件 \${repoInfo.name} (\${owner}/\${repo}) 未fork，执行fork...\`);
+                    await forkRepository(owner, repo, currentUser);
+                    totalForked++;
+                  }
+                  
+                  totalProcessed++;
+                } catch (error) {
+                  console.error(\`❌ 处理插件 \${repoInfo.name} (\${owner}/\${repo}) 时出错: \${error.message}\`);
+                  totalErrors++;
+                }
+              });
+              
+              await Promise.all(groupPromises);
+              
+              // 如果不是最后一组，等待30秒
+              if (i < groups.length - 1) {
+                console.log('⏱️  等待30秒后处理下一组...');
+                await delay(30000);
+              }
+            }
+            
+            console.log(\`\\n✅ 批量fork操作完成！\`);
+            console.log(\`📊 统计信息:\`);
+            console.log(\`  - 总共处理: \${totalProcessed} 个插件仓库\`);
+            console.log(\`  - 新fork: \${totalForked} 个\`);
+            console.log(\`  - 同步更新: \${totalSynced} 个\`);
+            console.log(\`  - 错误: \${totalErrors} 个\`);
+            
+            if (totalErrors > 0) {
+              console.log(\`\\n⚠️  有 \${totalErrors} 个仓库处理失败，请检查日志\`);
+            }
+            
+          } catch (error) {
+            console.error('❌ 批量fork操作失败:', error.message);
+            process.exit(1);
+          }
+        }
+        
+        // 运行主函数
+        main();
+        "
