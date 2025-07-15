@@ -63,228 +63,227 @@ jobs:
             echo "... 和其他 $((total_count - 10)) 个仓库"
           fi
 
-  fork-sync:
+  create-batches:
     runs-on: ubuntu-latest
     needs: prepare
     if: needs.prepare.outputs.total_count > 0
     outputs:
-      results: ${{ steps.collect_results.outputs.results }}
+      batches: ${{ steps.batch.outputs.batches }}
+      batch_count: ${{ steps.batch.outputs.batch_count }}
+    steps:
+      - name: Create batches
+        id: batch
+        run: |
+          echo "📦 正在创建批次..."
+          
+          # 读取仓库列表
+          repos='${{ needs.prepare.outputs.repos }}'
+          total_count=${{ needs.prepare.outputs.total_count }}
+          
+          # 每批处理200个仓库（留一些余量）
+          batch_size=200
+          batch_count=$(( (total_count + batch_size - 1) / batch_size ))
+          
+          echo "总仓库数: $total_count"
+          echo "批次大小: $batch_size"
+          echo "批次数量: $batch_count"
+          
+          # 创建批次数组
+          batches="["
+          for i in $(seq 0 $((batch_count - 1))); do
+            start_idx=$((i * batch_size))
+            end_idx=$(((i + 1) * batch_size))
+            
+            # 使用jq提取当前批次的仓库
+            batch_repos=$(echo "$repos" | jq -c ".[$start_idx:$end_idx]")
+            
+            if [ $i -gt 0 ]; then
+              batches="$batches,"
+            fi
+            batches="$batches{\"batch_id\":$i,\"repos\":$batch_repos}"
+          done
+          batches="$batches]"
+          
+          echo "batches=$batches" >> $GITHUB_OUTPUT
+          echo "batch_count=$batch_count" >> $GITHUB_OUTPUT
+          
+          echo "✅ 创建了 $batch_count 个批次"
+
+  fork-sync:
+    runs-on: ubuntu-latest
+    needs: [prepare, create-batches]
+    if: needs.create-batches.outputs.batch_count > 0
     strategy:
-      max-parallel: 5           # 降低并发数以避免rate limit
-      fail-fast: false         # 某个仓库失败不影响其他仓库
+      max-parallel: 3           # 降低并发批次数
+      fail-fast: false         # 某个批次失败不影响其他批次
       matrix:
-        repo: ${{ fromJson(needs.prepare.outputs.repos) }}
+        batch: ${{ fromJson(needs.create-batches.outputs.batches) }}
 
     steps:
       - name: Setup environment
         run: |
-          # 计算当前job在矩阵中的位置用于分组延迟
-          echo "REPO_URL=${{ matrix.repo }}" >> $GITHUB_ENV
-          echo "JOB_INDEX=${{ strategy.job-index }}" >> $GITHUB_ENV
-          echo "TOTAL_JOBS=${{ strategy.job-total }}" >> $GITHUB_ENV
+          echo "BATCH_ID=${{ matrix.batch.batch_id }}" >> $GITHUB_ENV
+          echo "📦 处理批次 ${{ matrix.batch.batch_id }}"
           
       - name: Setup GH CLI
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
           
-      - name: Group delay (Rate limiting protection)
-        if: ${{ strategy.job-index != 0 }}
+      - name: Batch delay (Rate limiting protection)
+        if: ${{ matrix.batch.batch_id != 0 }}
         run: |
-          # 检查是否需要延迟（每5个任务延迟一次）
-          if [ $((${JOB_INDEX} % 5)) -eq 0 ]; then
-            echo "⏱️  第 ${{ strategy.job-index }} 个任务，等待30秒防止rate limit..."
-            sleep 30
-          fi
+          # 每个批次之间延迟，避免rate limit
+          delay_seconds=$(( ${{ matrix.batch.batch_id }} * 10 ))
+          echo "⏱️  批次 ${{ matrix.batch.batch_id }} 延迟 ${delay_seconds} 秒..."
+          sleep $delay_seconds
           
-      - name: Extract repo info
-        id: repo_info
+      - name: Process batch repositories
         run: |
-          repo_url="${{ matrix.repo }}"
-          owner_repo=${repo_url#*github.com/}
-          owner_repo=${owner_repo%/}
-          owner=$(echo "$owner_repo" | cut -d/ -f1)
-          repo=$(echo "$owner_repo" | cut -d/ -f2)
+          echo "🔄 开始处理批次 ${{ matrix.batch.batch_id }} 的仓库..."
           
-          echo "owner_repo=$owner_repo" >> $GITHUB_OUTPUT
-          echo "owner=$owner" >> $GITHUB_OUTPUT
-          echo "repo=$repo" >> $GITHUB_OUTPUT
+          # 创建结果目录
+          mkdir -p results
           
-          echo "📦 处理仓库: $owner_repo"
-          
-      - name: Check if repo exists
-        id: check_repo
-        run: |
-          if gh repo view "${{ steps.repo_info.outputs.owner_repo }}" --json name >/dev/null 2>&1; then
-            echo "repo_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ 仓库存在: ${{ steps.repo_info.outputs.owner_repo }}"
-          else
-            echo "repo_exists=false" >> $GITHUB_OUTPUT
-            echo "❌ 仓库不存在或无法访问: ${{ steps.repo_info.outputs.owner_repo }}"
-          fi
-          
-      - name: Check fork status
-        id: check_fork
-        if: steps.check_repo.outputs.repo_exists == 'true'
-        run: |
-          my_login=$(gh api user --jq .login)
-          my_fork="${my_login}/${{ steps.repo_info.outputs.repo }}"
-          
-          if gh repo view "$my_fork" --json name,parent >/dev/null 2>&1; then
-            # 检查是否是正确的fork
-            parent_name=$(gh repo view "$my_fork" --json parent --jq '.parent.nameWithOwner // empty')
-            if [ "$parent_name" = "${{ steps.repo_info.outputs.owner_repo }}" ]; then
-              echo "fork_exists=true" >> $GITHUB_OUTPUT
-              echo "🔄 已fork: $my_fork <- ${{ steps.repo_info.outputs.owner_repo }}"
-            else
-              echo "fork_exists=false" >> $GITHUB_OUTPUT
-              echo "⚠️  仓库 $my_fork 存在但不是正确的fork"
+          # 处理当前批次的所有仓库
+          repos='${{ toJson(matrix.batch.repos) }}'
+          echo "$repos" | jq -r '.[]' | while read -r repo_url; do
+            echo "📦 处理仓库: $repo_url"
+            
+            # 提取仓库信息
+            owner_repo=${repo_url#*github.com/}
+            owner_repo=${owner_repo%/}
+            owner=$(echo "$owner_repo" | cut -d/ -f1)
+            repo=$(echo "$owner_repo" | cut -d/ -f2)
+            
+            # 检查仓库是否存在
+            if ! gh repo view "$owner_repo" --json name >/dev/null 2>&1; then
+              echo "❌ 仓库不存在: $owner_repo"
+              
+              # 保存结果
+              jq -n \
+                --arg repo "$owner_repo" \
+                --arg owner "$owner" \
+                --arg repo_name "$repo" \
+                --arg status "not_found" \
+                --arg message "仓库不存在或无法访问" \
+                --arg my_fork "unknown/$repo" \
+                --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{
+                  repo: $repo,
+                  owner: $owner,
+                  repo_name: $repo_name,
+                  status: $status,
+                  message: $message,
+                  my_fork: $my_fork,
+                  timestamp: $timestamp
+                }' > "results/${owner}_${repo}.json"
+              
+              continue
             fi
-          else
-            echo "fork_exists=false" >> $GITHUB_OUTPUT
-            echo "🆕 尚未fork: ${{ steps.repo_info.outputs.owner_repo }}"
-          fi
-          
-      - name: Fork repository
-        if: |
-          steps.check_repo.outputs.repo_exists == 'true' && 
-          steps.check_fork.outputs.fork_exists == 'false' &&
-          !inputs.dry_run
-        run: |
-          echo "🍴 正在fork: ${{ steps.repo_info.outputs.owner_repo }}"
-          
-          if gh repo fork "${{ steps.repo_info.outputs.owner_repo }}" --clone=false; then
-            echo "✅ Fork成功: ${{ steps.repo_info.outputs.owner_repo }}"
-            echo "FORK_RESULT=success" >> $GITHUB_ENV
-          else
-            echo "❌ Fork失败: ${{ steps.repo_info.outputs.owner_repo }}"
-            echo "FORK_RESULT=failed" >> $GITHUB_ENV
-            exit 1
-          fi
-          
-      - name: Sync fork
-        if: |
-          steps.check_repo.outputs.repo_exists == 'true' && 
-          steps.check_fork.outputs.fork_exists == 'true' &&
-          (inputs.force_sync || github.event_name == 'schedule') &&
-          !inputs.dry_run
-        run: |
-          my_login=$(gh api user --jq .login)
-          my_fork="${my_login}/${{ steps.repo_info.outputs.repo }}"
-          
-          echo "🔄 正在同步fork: $my_fork"
-          
-          # 使用GitHub CLI的sync命令（更安全简单）
-          if gh repo sync "$my_fork" --source "${{ steps.repo_info.outputs.owner_repo }}"; then
-            echo "✅ 同步成功: $my_fork"
-            echo "SYNC_RESULT=success" >> $GITHUB_ENV
-          else
-            echo "⚠️  同步失败，可能是没有新的更新: $my_fork"
-            echo "SYNC_RESULT=no_changes" >> $GITHUB_ENV
-            # 不退出，因为可能只是没有更新
-          fi
-          
-      - name: Set result status
-        if: always()
-        run: |
-          # 确定最终状态
-          if [ "${{ steps.check_repo.outputs.repo_exists }}" = "false" ]; then
-            echo "FINAL_STATUS=not_found" >> $GITHUB_ENV
-            echo "STATUS_MESSAGE=仓库不存在或无法访问" >> $GITHUB_ENV
-          elif [ "${{ inputs.dry_run }}" = "true" ]; then
-            if [ "${{ steps.check_fork.outputs.fork_exists }}" = "false" ]; then
-              echo "FINAL_STATUS=will_fork" >> $GITHUB_ENV
-              echo "STATUS_MESSAGE=将会fork" >> $GITHUB_ENV
-            else
-              echo "FINAL_STATUS=will_sync" >> $GITHUB_ENV
-              echo "STATUS_MESSAGE=已fork，需要时会同步" >> $GITHUB_ENV
-            fi
-          elif [ "${{ steps.check_fork.outputs.fork_exists }}" = "false" ]; then
-            # 需要fork的情况
-            if [ "$FORK_RESULT" = "success" ]; then
-              echo "FINAL_STATUS=forked" >> $GITHUB_ENV
-              echo "STATUS_MESSAGE=新fork成功" >> $GITHUB_ENV
-            else
-              echo "FINAL_STATUS=fork_failed" >> $GITHUB_ENV
-              echo "STATUS_MESSAGE=fork失败" >> $GITHUB_ENV
-            fi
-          else
-            # 已经fork，可能需要同步
-            if [ "${{ inputs.force_sync }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
-              if [ "$SYNC_RESULT" = "success" ]; then
-                echo "FINAL_STATUS=synced" >> $GITHUB_ENV
-                echo "STATUS_MESSAGE=同步成功" >> $GITHUB_ENV
-              elif [ "$SYNC_RESULT" = "no_changes" ]; then
-                echo "FINAL_STATUS=up_to_date" >> $GITHUB_ENV
-                echo "STATUS_MESSAGE=已是最新" >> $GITHUB_ENV
+            
+            echo "✅ 仓库存在: $owner_repo"
+            
+            # 获取当前用户信息
+            my_login=$(gh api user --jq .login)
+            my_fork="${my_login}/$repo"
+            
+            # 检查是否已fork
+            fork_exists=false
+            if gh repo view "$my_fork" --json name,parent >/dev/null 2>&1; then
+              parent_name=$(gh repo view "$my_fork" --json parent --jq '.parent.nameWithOwner // empty')
+              if [ "$parent_name" = "$owner_repo" ]; then
+                fork_exists=true
+                echo "🔄 已fork: $my_fork <- $owner_repo"
               else
-                echo "FINAL_STATUS=sync_failed" >> $GITHUB_ENV
-                echo "STATUS_MESSAGE=同步失败" >> $GITHUB_ENV
+                echo "⚠️  仓库 $my_fork 存在但不是正确的fork"
               fi
             else
-              echo "FINAL_STATUS=already_forked" >> $GITHUB_ENV
-              echo "STATUS_MESSAGE=已fork（未同步）" >> $GITHUB_ENV
+              echo "🆕 尚未fork: $owner_repo"
             fi
-          fi
+            
+            # 根据情况执行操作
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              # 试运行模式
+              if [ "$fork_exists" = "false" ]; then
+                status="will_fork"
+                message="将会fork"
+              else
+                status="will_sync"
+                message="已fork，需要时会同步"
+              fi
+            elif [ "$fork_exists" = "false" ]; then
+              # 需要fork
+              echo "🍴 正在fork: $owner_repo"
+              if gh repo fork "$owner_repo" --clone=false; then
+                echo "✅ Fork成功: $owner_repo"
+                status="forked"
+                message="新fork成功"
+              else
+                echo "❌ Fork失败: $owner_repo"
+                status="fork_failed"
+                message="fork失败"
+              fi
+            else
+              # 已fork，可能需要同步
+              if [ "${{ inputs.force_sync }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+                echo "🔄 正在同步fork: $my_fork"
+                if gh repo sync "$my_fork" --source "$owner_repo"; then
+                  echo "✅ 同步成功: $my_fork"
+                  status="synced"
+                  message="同步成功"
+                else
+                  echo "⚠️  同步失败或无更新: $my_fork"
+                  status="up_to_date"
+                  message="已是最新"
+                fi
+              else
+                status="already_forked"
+                message="已fork（未同步）"
+              fi
+            fi
+            
+            # 保存结果
+            jq -n \
+              --arg repo "$owner_repo" \
+              --arg owner "$owner" \
+              --arg repo_name "$repo" \
+              --arg status "$status" \
+              --arg message "$message" \
+              --arg my_fork "$my_fork" \
+              --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{
+                repo: $repo,
+                owner: $owner,
+                repo_name: $repo_name,
+                status: $status,
+                message: $message,
+                my_fork: $my_fork,
+                timestamp: $timestamp
+              }' > "results/${owner}_${repo}.json"
+            
+            # 防止rate limit - 每个仓库之间短暂延迟
+            sleep 2
+          done
           
-      - name: Save result
-        if: always()
-        run: |
-          my_login=$(gh api user --jq .login 2>/dev/null || echo "unknown")
+          echo "✅ 批次 ${{ matrix.batch.batch_id }} 处理完成"
           
-          # 创建结果JSON
-          result_json=$(jq -n \
-            --arg repo "${{ steps.repo_info.outputs.owner_repo }}" \
-            --arg owner "${{ steps.repo_info.outputs.owner }}" \
-            --arg repo_name "${{ steps.repo_info.outputs.repo }}" \
-            --arg status "$FINAL_STATUS" \
-            --arg message "$STATUS_MESSAGE" \
-            --arg my_fork "${my_login}/${{ steps.repo_info.outputs.repo }}" \
-            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{
-              repo: $repo,
-              owner: $owner,
-              repo_name: $repo_name,
-              status: $status,
-              message: $message,
-              my_fork: $my_fork,
-              timestamp: $timestamp
-            }')
-          
-          echo "RESULT_JSON=$result_json" >> $GITHUB_ENV
-          
-          # 保存到文件
-          mkdir -p results
-          echo "$result_json" > "results/${{ steps.repo_info.outputs.owner }}_${{ steps.repo_info.outputs.repo }}.json"
-          
-      - name: Upload result artifact
+      - name: Upload batch results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: result-${{ steps.repo_info.outputs.owner }}-${{ steps.repo_info.outputs.repo }}
+          name: batch-results-${{ matrix.batch.batch_id }}
           path: results/
           retention-days: 7
 
-      - name: Dry run summary
-        if: inputs.dry_run
-        run: |
-          echo "🔍 [DRY RUN] 仓库: ${{ steps.repo_info.outputs.owner_repo }}"
-          if [ "${{ steps.check_repo.outputs.repo_exists }}" = "false" ]; then
-            echo "  ❌ 仓库不存在，跳过"
-          elif [ "${{ steps.check_fork.outputs.fork_exists }}" = "false" ]; then
-            echo "  🍴 将会fork此仓库"
-          else
-            echo "  🔄 已fork，需要时会同步"
-          fi
-
   collect-results:
     runs-on: ubuntu-latest
-    needs: [prepare, fork-sync]
+    needs: [prepare, create-batches, fork-sync]
     if: always() && needs.prepare.outputs.total_count > 0
     steps:
-      - name: Download all results
+      - name: Download all batch results
         uses: actions/download-artifact@v4
         with:
-          pattern: result-*
+          pattern: batch-results-*
           path: all-results/
           merge-multiple: true
 
@@ -424,7 +423,7 @@ jobs:
 
   summary:
     runs-on: ubuntu-latest
-    needs: [prepare, fork-sync, collect-results]
+    needs: [prepare, create-batches, fork-sync, collect-results]
     if: always()
     steps:
       - name: Final summary
@@ -433,6 +432,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "📊 **基本信息:**" >> $GITHUB_STEP_SUMMARY
           echo "- 总仓库数: ${{ needs.prepare.outputs.total_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 批次数量: ${{ needs.create-batches.outputs.batch_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- 操作模式: ${{ inputs.dry_run && '🔍 试运行' || '▶️ 实际执行' }}" >> $GITHUB_STEP_SUMMARY
           echo "- 强制同步: ${{ inputs.force_sync && '✅ 是' || '❌ 否' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -456,3 +456,4 @@ jobs:
           echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
           echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
           echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
+          echo "- 批次处理避免了矩阵限制问题" >> $GITHUB_STEP_SUMMARY
