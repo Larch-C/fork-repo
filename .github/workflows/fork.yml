@@ -88,10 +88,13 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
           
       - name: Group delay (Rate limiting protection)
-        if: ${{ strategy.job-index != 0 && strategy.job-index % 5 == 0 }}
+        if: ${{ strategy.job-index != 0 }}
         run: |
-          echo "⏱️  第 ${{ strategy.job-index }} 个任务，等待30秒防止rate limit..."
-          sleep 30
+          # 检查是否需要延迟（每5个任务延迟一次）
+          if [ $((${JOB_INDEX} % 5)) -eq 0 ]; then
+            echo "⏱️  第 ${{ strategy.job-index }} 个任务，等待30秒防止rate limit..."
+            sleep 30
+          fi
           
       - name: Extract repo info
         id: repo_info
