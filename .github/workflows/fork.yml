@@ -74,7 +74,7 @@ jobs:
       fail-fast: false         # 某个仓库失败不影响其他仓库
       matrix:
         repo: ${{ fromJson(needs.prepare.outputs.repos) }}
-    
+
     steps:
       - name: Setup environment
         run: |
@@ -260,7 +260,7 @@ jobs:
           name: result-${{ steps.repo_info.outputs.owner }}-${{ steps.repo_info.outputs.repo }}
           path: results/
           retention-days: 7
-          
+
       - name: Dry run summary
         if: inputs.dry_run
         run: |
@@ -284,7 +284,7 @@ jobs:
           pattern: result-*
           path: all-results/
           merge-multiple: true
-          
+
       - name: Generate results table
         run: |
           echo "📊 正在生成结果表格..."
@@ -413,7 +413,7 @@ jobs:
           name: fork-sync-results
           path: results_summary.md
           retention-days: 30
-          
+
       - name: Display results in step summary
         run: |
           echo "📊 正在添加结果到步骤摘要..."
