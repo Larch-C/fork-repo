@@ -204,13 +204,45 @@ jobs:
             
             # 检查是否已fork
             fork_exists=false
-            if gh repo view "$my_fork" --json name,parent >/dev/null 2>&1; then
-              parent_name=$(gh repo view "$my_fork" --json parent --jq '.parent.nameWithOwner // empty')
-              if [ "$parent_name" = "$owner_repo" ]; then
-                fork_exists=true
-                echo "🔄 已fork: $my_fork <- $owner_repo"
+            if gh repo view "$my_fork" --json name,parent,isFork >/dev/null 2>&1; then
+              # 获取仓库信息
+              repo_info=$(gh repo view "$my_fork" --json name,parent,isFork)
+              is_fork=$(echo "$repo_info" | jq -r '.isFork // false')
+              parent_name=$(echo "$repo_info" | jq -r '.parent.nameWithOwner // empty')
+              
+              if [ "$is_fork" = "true" ]; then
+                # 如果是fork，检查parent是否匹配或尝试同步
+                if [ -n "$parent_name" ] && [ "$parent_name" = "$owner_repo" ]; then
+                  fork_exists=true
+                  echo "🔄 已fork: $my_fork <- $owner_repo"
+                elif [ -n "$parent_name" ]; then
+                  # parent不匹配，但仍然是fork，可能是API返回问题
+                  echo "⚠️  检测到fork但parent不匹配: $my_fork (parent: $parent_name, expected: $owner_repo)"
+                  # 尝试同步看是否能成功，如果能成功说明确实是正确的fork
+                  echo "🔍 尝试同步以验证fork关系..."
+                  if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
+                    fork_exists=true
+                    echo "✅ 同步测试成功，确认为正确的fork"
+                  else
+                    echo "❌ 同步测试失败，可能不是正确的fork"
+                  fi
+                else
+                  echo "⚠️  仓库标记为fork但无parent信息，尝试同步验证..."
+                  # 没有parent信息但标记为fork，尝试同步验证
+                  if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
+                    fork_exists=true
+                    echo "✅ 同步测试成功，确认为正确的fork"
+                  else
+                    echo "❌ 同步测试失败，可能不是正确的fork"
+                  fi
+                fi
               else
-                echo "⚠️  仓库 $my_fork 存在但不是正确的fork"
+                # 不是fork，检查是否是同名仓库
+                if [ -n "$parent_name" ]; then
+                  echo "⚠️  仓库 $my_fork 存在但不是fork (parent: $parent_name)"
+                else
+                  echo "⚠️  仓库 $my_fork 存在但不是fork (独立仓库)"
+                fi
               fi
             else
               echo "🆕 尚未fork: $owner_repo"
@@ -239,21 +271,30 @@ jobs:
                 message="fork失败"
               fi
             else
-              # 已fork，可能需要同步
+              # 已fork，执行同步
+              echo "🔄 正在同步fork: $my_fork"
               if [ "${{ inputs.force_sync }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
-                echo "🔄 正在同步fork: $my_fork"
+                # 强制同步或定时任务
                 if gh repo sync "$my_fork" --source "$owner_repo"; then
                   echo "✅ 同步成功: $my_fork"
                   status="synced"
                   message="同步成功"
                 else
-                  echo "⚠️  同步失败或无更新: $my_fork"
-                  status="up_to_date"
-                  message="已是最新"
+                  echo "⚠️  同步失败，可能已是最新或存在冲突: $my_fork"
+                  status="sync_attempted"
+                  message="同步失败或已最新"
                 fi
               else
-                status="already_forked"
-                message="已fork（未同步）"
+                # 非强制模式，检查是否需要同步
+                if gh repo sync "$my_fork" --source "$owner_repo"; then
+                  echo "✅ 同步成功: $my_fork"
+                  status="synced"
+                  message="自动同步成功"
+                else
+                  echo "ℹ️  无需同步或同步失败: $my_fork"
+                  status="up_to_date"
+                  message="已是最新或无法同步"
+                fi
               fi
             fi
             
@@ -352,6 +393,10 @@ jobs:
                     forked=$((forked + 1))
                     ;;
                   "synced")
+                    icon="🔄"
+                    synced=$((synced + 1))
+                    ;;
+                  "sync_attempted")
                     icon="🔄"
                     synced=$((synced + 1))
                     ;;
