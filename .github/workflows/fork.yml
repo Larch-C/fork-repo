@@ -609,4 +609,12 @@ jobs:
           else
             echo "⚠️  **结果收集失败**" >> $GITHUB_STEP_SUMMARY
             echo "- 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 结果收集: ${{ needs.collect-results.result }
+            echo "- 结果收集: ${{ needs.collect-results.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **下次运行建议:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
+          echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
+          echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
+          echo "- 批次处理避免了矩阵限制问题" >> $GITHUB_STEP_SUMMARY
