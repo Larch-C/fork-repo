@@ -170,9 +170,9 @@ jobs:
             owner=$(echo "$owner_repo" | cut -d/ -f1)
             repo=$(echo "$owner_repo" | cut -d/ -f2)
             
-            # 检查仓库是否存在
+            # 检查原始仓库是否存在
             if ! gh repo view "$owner_repo" --json name >/dev/null 2>&1; then
-              echo "❌ 仓库不存在: $owner_repo"
+              echo "❌ 原始仓库不存在: $owner_repo"
               
               # 保存结果
               jq -n \
@@ -180,7 +180,7 @@ jobs:
                 --arg owner "$owner" \
                 --arg repo_name "$repo" \
                 --arg status "not_found" \
-                --arg message "仓库不存在或无法访问" \
+                --arg message "原始仓库不存在或无法访问" \
                 --arg my_fork "unknown/$repo" \
                 --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 '{
@@ -196,55 +196,72 @@ jobs:
               continue
             fi
             
-            echo "✅ 仓库存在: $owner_repo"
+            echo "✅ 原始仓库存在: $owner_repo"
             
             # 获取当前用户信息
             my_login=$(gh api user --jq .login)
             my_fork="${my_login}/$repo"
             
-            # 检查是否已fork
+            # 增强的fork状态检查
             fork_exists=false
-            if gh repo view "$my_fork" --json name,parent,isFork >/dev/null 2>&1; then
-              # 获取仓库信息
-              repo_info=$(gh repo view "$my_fork" --json name,parent,isFork)
+            fork_status="unknown"
+            
+            # 检查我的fork是否存在
+            if gh repo view "$my_fork" --json name,parent,isFork,nameWithOwner >/dev/null 2>&1; then
+              # 获取详细的仓库信息
+              repo_info=$(gh repo view "$my_fork" --json name,parent,isFork,nameWithOwner)
               is_fork=$(echo "$repo_info" | jq -r '.isFork // false')
               parent_name=$(echo "$repo_info" | jq -r '.parent.nameWithOwner // empty')
               
+              echo "🔍 检查fork状态: is_fork=$is_fork, parent=$parent_name"
+              
               if [ "$is_fork" = "true" ]; then
-                # 如果是fork，检查parent是否匹配或尝试同步
                 if [ -n "$parent_name" ] && [ "$parent_name" = "$owner_repo" ]; then
+                  # 完美匹配的fork
                   fork_exists=true
-                  echo "🔄 已fork: $my_fork <- $owner_repo"
+                  fork_status="valid_fork"
+                  echo "✅ 已fork且parent匹配: $my_fork <- $owner_repo"
                 elif [ -n "$parent_name" ]; then
-                  # parent不匹配，但仍然是fork，可能是API返回问题
-                  echo "⚠️  检测到fork但parent不匹配: $my_fork (parent: $parent_name, expected: $owner_repo)"
-                  # 尝试同步看是否能成功，如果能成功说明确实是正确的fork
-                  echo "🔍 尝试同步以验证fork关系..."
-                  if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
-                    fork_exists=true
-                    echo "✅ 同步测试成功，确认为正确的fork"
-                  else
-                    echo "❌ 同步测试失败，可能不是正确的fork"
-                  fi
+                  # fork但parent不匹配
+                  fork_exists=false
+                  fork_status="wrong_parent"
+                  echo "⚠️  已fork但parent不匹配: $my_fork (parent: $parent_name, expected: $owner_repo)"
                 else
-                  echo "⚠️  仓库标记为fork但无parent信息，尝试同步验证..."
-                  # 没有parent信息但标记为fork，尝试同步验证
-                  if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
+                  # fork但没有parent信息，尝试通过API获取更多信息
+                  echo "🔍 Fork无parent信息，尝试API检查..."
+                  
+                  # 使用GitHub API获取更详细信息
+                  api_info=$(gh api repos/"$my_fork" --jq '{fork: .fork, parent: .parent.full_name}' 2>/dev/null || echo '{}')
+                  api_parent=$(echo "$api_info" | jq -r '.parent // empty')
+                  
+                  if [ -n "$api_parent" ] && [ "$api_parent" = "$owner_repo" ]; then
                     fork_exists=true
-                    echo "✅ 同步测试成功，确认为正确的fork"
+                    fork_status="valid_fork_api"
+                    echo "✅ API确认为正确的fork: $my_fork <- $api_parent"
                   else
-                    echo "❌ 同步测试失败，可能不是正确的fork"
+                    # 最后尝试：直接测试同步是否可行
+                    echo "🧪 测试同步兼容性..."
+                    if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
+                      fork_exists=true
+                      fork_status="valid_fork_sync_test"
+                      echo "✅ 同步测试通过，确认为有效fork"
+                    else
+                      fork_exists=false
+                      fork_status="invalid_fork"
+                      echo "❌ 同步测试失败，可能不是正确的fork"
+                    fi
                   fi
                 fi
               else
-                # 不是fork，检查是否是同名仓库
-                if [ -n "$parent_name" ]; then
-                  echo "⚠️  仓库 $my_fork 存在但不是fork (parent: $parent_name)"
-                else
-                  echo "⚠️  仓库 $my_fork 存在但不是fork (独立仓库)"
-                fi
+                # 不是fork，是同名的独立仓库
+                fork_exists=false
+                fork_status="independent_repo"
+                echo "⚠️  仓库 $my_fork 存在但不是fork (独立仓库)"
               fi
             else
+              # fork不存在
+              fork_exists=false
+              fork_status="not_exists"
               echo "🆕 尚未fork: $owner_repo"
             fi
             
@@ -252,48 +269,109 @@ jobs:
             if [ "${{ inputs.dry_run }}" = "true" ]; then
               # 试运行模式
               if [ "$fork_exists" = "false" ]; then
-                status="will_fork"
-                message="将会fork"
+                if [ "$fork_status" = "wrong_parent" ] || [ "$fork_status" = "independent_repo" ]; then
+                  status="conflict_detected"
+                  message="检测到同名仓库冲突，需要手动处理"
+                else
+                  status="will_fork"
+                  message="将会fork"
+                fi
               else
                 status="will_sync"
                 message="已fork，需要时会同步"
               fi
             elif [ "$fork_exists" = "false" ]; then
               # 需要fork
-              echo "🍴 正在fork: $owner_repo"
-              if gh repo fork "$owner_repo" --clone=false; then
-                echo "✅ Fork成功: $owner_repo"
-                status="forked"
-                message="新fork成功"
+              if [ "$fork_status" = "wrong_parent" ] || [ "$fork_status" = "independent_repo" ]; then
+                # 存在冲突，跳过
+                echo "⚠️  跳过fork，存在同名仓库: $my_fork"
+                status="skipped_conflict"
+                message="跳过：存在同名仓库冲突"
               else
-                echo "❌ Fork失败: $owner_repo"
-                status="fork_failed"
-                message="fork失败"
+                # 正常fork
+                echo "🍴 正在fork: $owner_repo"
+                
+                # 捕获fork命令的输出和错误
+                fork_output=$(gh repo fork "$owner_repo" --clone=false 2>&1)
+                fork_exit_code=$?
+                
+                if [ $fork_exit_code -eq 0 ]; then
+                  echo "✅ Fork成功: $owner_repo"
+                  status="forked"
+                  message="新fork成功"
+                else
+                  # 检查是否是"already exists"错误
+                  if echo "$fork_output" | grep -q "already exists"; then
+                    echo "ℹ️  Fork已存在，检查状态: $my_fork"
+                    # 重新检查fork状态
+                    if gh repo view "$my_fork" --json isFork,parent >/dev/null 2>&1; then
+                      updated_info=$(gh repo view "$my_fork" --json isFork,parent)
+                      updated_is_fork=$(echo "$updated_info" | jq -r '.isFork // false')
+                      updated_parent=$(echo "$updated_info" | jq -r '.parent.nameWithOwner // empty')
+                      
+                      if [ "$updated_is_fork" = "true" ] && [ "$updated_parent" = "$owner_repo" ]; then
+                        status="already_forked"
+                        message="Fork已存在"
+                        fork_exists=true
+                      else
+                        status="fork_conflict"
+                        message="Fork冲突：已存在同名仓库"
+                      fi
+                    else
+                      status="fork_conflict"
+                      message="Fork冲突：无法确认状态"
+                    fi
+                  else
+                    echo "❌ Fork失败: $owner_repo"
+                    echo "错误输出: $fork_output"
+                    status="fork_failed"
+                    message="Fork失败: $(echo "$fork_output" | head -1)"
+                  fi
+                fi
               fi
             else
               # 已fork，执行同步
               echo "🔄 正在同步fork: $my_fork"
+              
+              sync_needed=false
               if [ "${{ inputs.force_sync }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
-                # 强制同步或定时任务
-                if gh repo sync "$my_fork" --source "$owner_repo"; then
+                sync_needed=true
+                echo "🔄 强制同步模式"
+              fi
+              
+              if [ "$sync_needed" = "true" ]; then
+                # 执行同步
+                sync_output=$(gh repo sync "$my_fork" --source "$owner_repo" 2>&1)
+                sync_exit_code=$?
+                
+                if [ $sync_exit_code -eq 0 ]; then
                   echo "✅ 同步成功: $my_fork"
                   status="synced"
                   message="同步成功"
                 else
-                  echo "⚠️  同步失败，可能已是最新或存在冲突: $my_fork"
-                  status="sync_attempted"
-                  message="同步失败或已最新"
+                  # 检查同步失败的原因
+                  if echo "$sync_output" | grep -q "up to date\|already up-to-date"; then
+                    echo "ℹ️  已是最新: $my_fork"
+                    status="up_to_date"
+                    message="已是最新版本"
+                  else
+                    echo "⚠️  同步失败: $my_fork"
+                    echo "错误输出: $sync_output"
+                    status="sync_failed"
+                    message="同步失败: $(echo "$sync_output" | head -1)"
+                  fi
                 fi
               else
                 # 非强制模式，检查是否需要同步
-                if gh repo sync "$my_fork" --source "$owner_repo"; then
+                echo "🔍 检查是否需要同步..."
+                if gh repo sync "$my_fork" --source "$owner_repo" 2>/dev/null; then
                   echo "✅ 同步成功: $my_fork"
                   status="synced"
                   message="自动同步成功"
                 else
-                  echo "ℹ️  无需同步或同步失败: $my_fork"
+                  echo "ℹ️  无需同步: $my_fork"
                   status="up_to_date"
-                  message="已是最新或无法同步"
+                  message="已是最新或无需同步"
                 fi
               fi
             fi
@@ -306,6 +384,7 @@ jobs:
               --arg status "$status" \
               --arg message "$message" \
               --arg my_fork "$my_fork" \
+              --arg fork_status "$fork_status" \
               --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{
                 repo: $repo,
@@ -314,11 +393,12 @@ jobs:
                 status: $status,
                 message: $message,
                 my_fork: $my_fork,
+                fork_status: $fork_status,
                 timestamp: $timestamp
               }' > "results/${owner}_${repo}.json"
             
             # 防止rate limit - 每个仓库之间短暂延迟
-            sleep 2
+            sleep 3
           done
           
           echo "✅ 批次 ${{ matrix.batch.batch_id }} 处理完成"
@@ -363,12 +443,13 @@ jobs:
           already_forked=0
           failed=0
           not_found=0
+          conflicts=0
           
           # 创建表格头
           echo "## 📋 详细结果" >> results_summary.md
           echo "" >> results_summary.md
-          echo "| 仓库 | 状态 | 我的Fork | 说明 | 时间 |" >> results_summary.md
-          echo "|------|------|----------|------|------|" >> results_summary.md
+          echo "| 仓库 | 状态 | 我的Fork | 说明 | Fork状态 | 时间 |" >> results_summary.md
+          echo "|------|------|----------|------|----------|------|" >> results_summary.md
           
           # 处理所有结果文件
           if [ -d "all-results" ]; then
@@ -381,6 +462,7 @@ jobs:
                 status=$(jq -r '.status' "$file")
                 message=$(jq -r '.message' "$file")
                 my_fork=$(jq -r '.my_fork' "$file")
+                fork_status=$(jq -r '.fork_status // "unknown"' "$file")
                 timestamp=$(jq -r '.timestamp' "$file")
                 
                 # 格式化时间
@@ -416,6 +498,10 @@ jobs:
                     icon="🚫"
                     not_found=$((not_found + 1))
                     ;;
+                  "skipped_conflict"|"fork_conflict"|"conflict_detected")
+                    icon="⚠️"
+                    conflicts=$((conflicts + 1))
+                    ;;
                   "will_fork")
                     icon="🔮"
                     ;;
@@ -427,8 +513,18 @@ jobs:
                     ;;
                 esac
                 
+                # 格式化fork状态
+                case "$fork_status" in
+                  "valid_fork") fork_status_display="✅ 有效" ;;
+                  "wrong_parent") fork_status_display="⚠️ 错误父级" ;;
+                  "independent_repo") fork_status_display="🏠 独立仓库" ;;
+                  "not_exists") fork_status_display="❌ 不存在" ;;
+                  "invalid_fork") fork_status_display="❌ 无效fork" ;;
+                  *) fork_status_display="❓ 未知" ;;
+                esac
+                
                 # 添加到表格
-                echo "| [\`$repo\`](https://github.com/$repo) | $icon $message | [\`$my_fork\`](https://github.com/$my_fork) | $message | $formatted_time |" >> results_summary.md
+                echo "| [\`$repo\`](https://github.com/$repo) | $icon $message | [\`$my_fork\`](https://github.com/$my_fork) | $message | $fork_status_display | $formatted_time |" >> results_summary.md
               fi
             done
           fi
@@ -445,6 +541,7 @@ jobs:
             [ $synced -gt 0 ] && echo "| 🔄 同步成功 | $synced | $(( synced * 100 / total ))% |" >> results_summary.md
             [ $up_to_date -gt 0 ] && echo "| ✅ 已是最新 | $up_to_date | $(( up_to_date * 100 / total ))% |" >> results_summary.md
             [ $already_forked -gt 0 ] && echo "| 📁 已fork(未同步) | $already_forked | $(( already_forked * 100 / total ))% |" >> results_summary.md
+            [ $conflicts -gt 0 ] && echo "| ⚠️ 冲突/跳过 | $conflicts | $(( conflicts * 100 / total ))% |" >> results_summary.md
             [ $failed -gt 0 ] && echo "| ❌ 失败 | $failed | $(( failed * 100 / total ))% |" >> results_summary.md
             [ $not_found -gt 0 ] && echo "| 🚫 仓库不存在 | $not_found | $(( not_found * 100 / total ))% |" >> results_summary.md
           fi
@@ -459,6 +556,9 @@ jobs:
           if [ $failed -gt 0 ]; then
             echo "- ⚠️  有 $failed 个仓库操作失败，建议检查权限或网络问题" >> results_summary.md
           fi
+          if [ $conflicts -gt 0 ]; then
+            echo "- ⚠️  有 $conflicts 个仓库存在冲突，需要手动处理同名仓库" >> results_summary.md
+          fi
           if [ $not_found -gt 0 ]; then
             echo "- 🔍 有 $not_found 个仓库不存在，可能已被删除或移动" >> results_summary.md
           fi
@@ -466,6 +566,7 @@ jobs:
             echo "- 🔄 有 $already_forked 个已fork仓库未同步，可使用'强制同步'选项更新" >> results_summary.md
           fi
           echo "- 📅 建议启用定期同步保持fork最新" >> results_summary.md
+          echo "- 🧹 对于冲突的仓库，建议手动检查并重命名或删除" >> results_summary.md
           
           echo "✅ 结果表格生成完成"
           
@@ -508,12 +609,4 @@ jobs:
           else
             echo "⚠️  **结果收集失败**" >> $GITHUB_STEP_SUMMARY
             echo "- 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 结果收集: ${{ needs.collect-results.result }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "🔄 **下次运行建议:**" >> $GITHUB_STEP_SUMMARY
-          echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
-          echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
-          echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
-          echo "- 批次处理避免了矩阵限制问题" >> $GITHUB_STEP_SUMMARY
+            echo "- 结果收集: ${{ needs.collect-results.result }
