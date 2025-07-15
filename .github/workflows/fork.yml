@@ -67,6 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: prepare
     if: needs.prepare.outputs.total_count > 0
+    outputs:
+      results: ${{ steps.collect_results.outputs.results }}
     strategy:
       max-parallel: 5           # 降低并发数以避免rate limit
       fail-fast: false         # 某个仓库失败不影响其他仓库
@@ -149,8 +151,10 @@ jobs:
           
           if gh repo fork "${{ steps.repo_info.outputs.owner_repo }}" --clone=false; then
             echo "✅ Fork成功: ${{ steps.repo_info.outputs.owner_repo }}"
+            echo "FORK_RESULT=success" >> $GITHUB_ENV
           else
             echo "❌ Fork失败: ${{ steps.repo_info.outputs.owner_repo }}"
+            echo "FORK_RESULT=failed" >> $GITHUB_ENV
             exit 1
           fi
           
@@ -169,10 +173,93 @@ jobs:
           # 使用GitHub CLI的sync命令（更安全简单）
           if gh repo sync "$my_fork" --source "${{ steps.repo_info.outputs.owner_repo }}"; then
             echo "✅ 同步成功: $my_fork"
+            echo "SYNC_RESULT=success" >> $GITHUB_ENV
           else
             echo "⚠️  同步失败，可能是没有新的更新: $my_fork"
+            echo "SYNC_RESULT=no_changes" >> $GITHUB_ENV
             # 不退出，因为可能只是没有更新
           fi
+          
+      - name: Set result status
+        if: always()
+        run: |
+          # 确定最终状态
+          if [ "${{ steps.check_repo.outputs.repo_exists }}" = "false" ]; then
+            echo "FINAL_STATUS=not_found" >> $GITHUB_ENV
+            echo "STATUS_MESSAGE=仓库不存在或无法访问" >> $GITHUB_ENV
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            if [ "${{ steps.check_fork.outputs.fork_exists }}" = "false" ]; then
+              echo "FINAL_STATUS=will_fork" >> $GITHUB_ENV
+              echo "STATUS_MESSAGE=将会fork" >> $GITHUB_ENV
+            else
+              echo "FINAL_STATUS=will_sync" >> $GITHUB_ENV
+              echo "STATUS_MESSAGE=已fork，需要时会同步" >> $GITHUB_ENV
+            fi
+          elif [ "${{ steps.check_fork.outputs.fork_exists }}" = "false" ]; then
+            # 需要fork的情况
+            if [ "$FORK_RESULT" = "success" ]; then
+              echo "FINAL_STATUS=forked" >> $GITHUB_ENV
+              echo "STATUS_MESSAGE=新fork成功" >> $GITHUB_ENV
+            else
+              echo "FINAL_STATUS=fork_failed" >> $GITHUB_ENV
+              echo "STATUS_MESSAGE=fork失败" >> $GITHUB_ENV
+            fi
+          else
+            # 已经fork，可能需要同步
+            if [ "${{ inputs.force_sync }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              if [ "$SYNC_RESULT" = "success" ]; then
+                echo "FINAL_STATUS=synced" >> $GITHUB_ENV
+                echo "STATUS_MESSAGE=同步成功" >> $GITHUB_ENV
+              elif [ "$SYNC_RESULT" = "no_changes" ]; then
+                echo "FINAL_STATUS=up_to_date" >> $GITHUB_ENV
+                echo "STATUS_MESSAGE=已是最新" >> $GITHUB_ENV
+              else
+                echo "FINAL_STATUS=sync_failed" >> $GITHUB_ENV
+                echo "STATUS_MESSAGE=同步失败" >> $GITHUB_ENV
+              fi
+            else
+              echo "FINAL_STATUS=already_forked" >> $GITHUB_ENV
+              echo "STATUS_MESSAGE=已fork（未同步）" >> $GITHUB_ENV
+            fi
+          fi
+          
+      - name: Save result
+        if: always()
+        run: |
+          my_login=$(gh api user --jq .login 2>/dev/null || echo "unknown")
+          
+          # 创建结果JSON
+          result_json=$(jq -n \
+            --arg repo "${{ steps.repo_info.outputs.owner_repo }}" \
+            --arg owner "${{ steps.repo_info.outputs.owner }}" \
+            --arg repo_name "${{ steps.repo_info.outputs.repo }}" \
+            --arg status "$FINAL_STATUS" \
+            --arg message "$STATUS_MESSAGE" \
+            --arg my_fork "${my_login}/${{ steps.repo_info.outputs.repo }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              repo: $repo,
+              owner: $owner,
+              repo_name: $repo_name,
+              status: $status,
+              message: $message,
+              my_fork: $my_fork,
+              timestamp: $timestamp
+            }')
+          
+          echo "RESULT_JSON=$result_json" >> $GITHUB_ENV
+          
+          # 保存到文件
+          mkdir -p results
+          echo "$result_json" > "results/${{ steps.repo_info.outputs.owner }}_${{ steps.repo_info.outputs.repo }}.json"
+          
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ steps.repo_info.outputs.owner }}-${{ steps.repo_info.outputs.repo }}
+          path: results/
+          retention-days: 7
           
       - name: Dry run summary
         if: inputs.dry_run
@@ -186,31 +273,183 @@ jobs:
             echo "  🔄 已fork，需要时会同步"
           fi
 
-  summary:
+  collect-results:
     runs-on: ubuntu-latest
     needs: [prepare, fork-sync]
+    if: always() && needs.prepare.outputs.total_count > 0
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: all-results/
+          merge-multiple: true
+          
+      - name: Generate results table
+        run: |
+          echo "📊 正在生成结果表格..."
+          
+          # 创建结果汇总
+          echo "# 🎯 AstrBot插件Fork/Sync结果报告" > results_summary.md
+          echo "" >> results_summary.md
+          echo "**操作时间:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> results_summary.md
+          echo "**操作模式:** ${{ inputs.dry_run && '🔍 试运行' || '▶️ 实际执行' }}" >> results_summary.md
+          echo "**总仓库数:** ${{ needs.prepare.outputs.total_count }}" >> results_summary.md
+          echo "" >> results_summary.md
+          
+          # 统计各种状态
+          total=0
+          forked=0
+          synced=0
+          up_to_date=0
+          already_forked=0
+          failed=0
+          not_found=0
+          
+          # 创建表格头
+          echo "## 📋 详细结果" >> results_summary.md
+          echo "" >> results_summary.md
+          echo "| 仓库 | 状态 | 我的Fork | 说明 | 时间 |" >> results_summary.md
+          echo "|------|------|----------|------|------|" >> results_summary.md
+          
+          # 处理所有结果文件
+          if [ -d "all-results" ]; then
+            for file in all-results/*.json; do
+              if [ -f "$file" ]; then
+                total=$((total + 1))
+                
+                # 提取数据
+                repo=$(jq -r '.repo' "$file")
+                status=$(jq -r '.status' "$file")
+                message=$(jq -r '.message' "$file")
+                my_fork=$(jq -r '.my_fork' "$file")
+                timestamp=$(jq -r '.timestamp' "$file")
+                
+                # 格式化时间
+                formatted_time=$(date -d "$timestamp" '+%H:%M' 2>/dev/null || echo "N/A")
+                
+                # 状态图标和统计
+                case "$status" in
+                  "forked")
+                    icon="🍴"
+                    forked=$((forked + 1))
+                    ;;
+                  "synced")
+                    icon="🔄"
+                    synced=$((synced + 1))
+                    ;;
+                  "up_to_date")
+                    icon="✅"
+                    up_to_date=$((up_to_date + 1))
+                    ;;
+                  "already_forked")
+                    icon="📁"
+                    already_forked=$((already_forked + 1))
+                    ;;
+                  "fork_failed"|"sync_failed")
+                    icon="❌"
+                    failed=$((failed + 1))
+                    ;;
+                  "not_found")
+                    icon="🚫"
+                    not_found=$((not_found + 1))
+                    ;;
+                  "will_fork")
+                    icon="🔮"
+                    ;;
+                  "will_sync")
+                    icon="🔮"
+                    ;;
+                  *)
+                    icon="❓"
+                    ;;
+                esac
+                
+                # 添加到表格
+                echo "| [\`$repo\`](https://github.com/$repo) | $icon $message | [\`$my_fork\`](https://github.com/$my_fork) | $message | $formatted_time |" >> results_summary.md
+              fi
+            done
+          fi
+          
+          # 添加统计摘要
+          echo "" >> results_summary.md
+          echo "## 📊 统计摘要" >> results_summary.md
+          echo "" >> results_summary.md
+          echo "| 状态 | 数量 | 百分比 |" >> results_summary.md
+          echo "|------|------|--------|" >> results_summary.md
+          
+          if [ $total -gt 0 ]; then
+            [ $forked -gt 0 ] && echo "| 🍴 新fork成功 | $forked | $(( forked * 100 / total ))% |" >> results_summary.md
+            [ $synced -gt 0 ] && echo "| 🔄 同步成功 | $synced | $(( synced * 100 / total ))% |" >> results_summary.md
+            [ $up_to_date -gt 0 ] && echo "| ✅ 已是最新 | $up_to_date | $(( up_to_date * 100 / total ))% |" >> results_summary.md
+            [ $already_forked -gt 0 ] && echo "| 📁 已fork(未同步) | $already_forked | $(( already_forked * 100 / total ))% |" >> results_summary.md
+            [ $failed -gt 0 ] && echo "| ❌ 失败 | $failed | $(( failed * 100 / total ))% |" >> results_summary.md
+            [ $not_found -gt 0 ] && echo "| 🚫 仓库不存在 | $not_found | $(( not_found * 100 / total ))% |" >> results_summary.md
+          fi
+          
+          echo "" >> results_summary.md
+          echo "**总计:** $total 个仓库" >> results_summary.md
+          
+          # 添加建议
+          echo "" >> results_summary.md
+          echo "## 💡 建议" >> results_summary.md
+          echo "" >> results_summary.md
+          if [ $failed -gt 0 ]; then
+            echo "- ⚠️  有 $failed 个仓库操作失败，建议检查权限或网络问题" >> results_summary.md
+          fi
+          if [ $not_found -gt 0 ]; then
+            echo "- 🔍 有 $not_found 个仓库不存在，可能已被删除或移动" >> results_summary.md
+          fi
+          if [ $already_forked -gt 0 ]; then
+            echo "- 🔄 有 $already_forked 个已fork仓库未同步，可使用'强制同步'选项更新" >> results_summary.md
+          fi
+          echo "- 📅 建议启用定期同步保持fork最新" >> results_summary.md
+          
+          echo "✅ 结果表格生成完成"
+          
+      - name: Upload results summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-sync-results
+          path: results_summary.md
+          retention-days: 30
+          
+      - name: Display results in step summary
+        run: |
+          echo "📊 正在添加结果到步骤摘要..."
+          cat results_summary.md >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [prepare, fork-sync, collect-results]
     if: always()
     steps:
-      - name: Job summary
+      - name: Final summary
         run: |
-          echo "# 🎯 AstrBot插件Fork/Sync操作摘要" >> $GITHUB_STEP_SUMMARY
+          echo "# 🎯 AstrBot插件Fork/Sync操作完成" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📊 **统计信息:**" >> $GITHUB_STEP_SUMMARY
+          echo "📊 **基本信息:**" >> $GITHUB_STEP_SUMMARY
           echo "- 总仓库数: ${{ needs.prepare.outputs.total_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- 操作模式: ${{ inputs.dry_run && '🔍 试运行' || '▶️ 实际执行' }}" >> $GITHUB_STEP_SUMMARY
           echo "- 强制同步: ${{ inputs.force_sync && '✅ 是' || '❌ 否' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ needs.fork-sync.result }}" = "success" ]; then
-            echo "✅ **结果:** 操作成功完成" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.fork-sync.result }}" = "failure" ]; then
-            echo "❌ **结果:** 部分操作失败，请检查日志" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.collect-results.result }}" = "success" ]; then
+            echo "✅ **详细结果表格已生成！**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📋 请查看上方的 \`collect-results\` 步骤获取完整的结果表格。" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💾 **结果文件:**" >> $GITHUB_STEP_SUMMARY
+            echo "- 可在 Artifacts 中下载 \`fork-sync-results\` 文件查看详细报告" >> $GITHUB_STEP_SUMMARY
+            echo "- 包含所有仓库的fork状态、链接和时间戳" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️  **结果:** 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️  **结果收集失败**" >> $GITHUB_STEP_SUMMARY
+            echo "- 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 结果收集: ${{ needs.collect-results.result }}" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📝 **建议:**" >> $GITHUB_STEP_SUMMARY
-          echo "- 如有失败，可能是由于仓库不存在、权限问题或网络问题" >> $GITHUB_STEP_SUMMARY
-          echo "- 建议定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
-          echo "- 遇到问题时可使用试运行模式检查" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **下次运行建议:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
+          echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
+          echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
