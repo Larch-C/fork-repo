@@ -111,6 +111,6 @@ https://github.com/AstrBotDevs/AstrBot_Plugins_Collection/blob/main/plugins.json
 
 ## 🛠️ 目前的问题
 
-- fork 后的仓库无法同步
+- fork 后的仓库无法同步 (解决了喵～)
 - action 运行到后面后，有些仓库 fork 失败
 - 存在 github API 限制
