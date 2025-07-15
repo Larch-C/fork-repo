@@ -14,7 +14,7 @@ on:
         default: false
         type: boolean
   schedule:                   # 每周日 03:00 UTC 自动同步
-    - cron: "0 3 * * 0"
+    - cron: "0 * * * *"
 
 env:
   PLUGIN_JSON_URL: "https://raw.githubusercontent.com/AstrBotDevs/AstrBot_Plugins_Collection/main/plugins.json"
