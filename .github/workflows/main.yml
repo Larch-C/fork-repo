@@ -13,8 +13,8 @@ on:
         required: false
         default: false
         type: boolean
-  schedule:                   # 每周日 03:00 UTC 自动同步
-    - cron: "0 3 * * 0"
+  schedule:                   # 每小时30 UTC 自动同步
+    - cron: "30 * * * *"
 
 env:
   PLUGIN_JSON_URL: "https://raw.githubusercontent.com/AstrBotDevs/AstrBot_Plugins_Collection/main/plugins.json"
@@ -80,8 +80,8 @@ jobs:
           repos='${{ needs.prepare.outputs.repos }}'
           total_count=${{ needs.prepare.outputs.total_count }}
           
-          # 每批处理200个仓库（留一些余量）
-          batch_size=200
+          # 每批处理50个仓库（留一些余量）
+          batch_size=50
           batch_count=$(( (total_count + batch_size - 1) / batch_size ))
           
           echo "总仓库数: $total_count"
