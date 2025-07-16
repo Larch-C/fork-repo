@@ -1,4 +1,4 @@
-name: Fork / Sync All AstrBot Plugins
+name: Sync All AstrBot Plugins
 
 on:
   workflow_dispatch:          # 手动触发
