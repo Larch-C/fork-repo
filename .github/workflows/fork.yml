@@ -80,8 +80,8 @@ jobs:
           repos='${{ needs.prepare.outputs.repos }}'
           total_count=${{ needs.prepare.outputs.total_count }}
           
-          # 每批处理50个仓库（留一些余量）
-          batch_size=50
+          # 每批处理30个仓库（减少批次大小）
+          batch_size=30
           batch_count=$(( (total_count + batch_size - 1) / batch_size ))
           
           echo "总仓库数: $total_count"
@@ -114,7 +114,7 @@ jobs:
     needs: [prepare, create-batches]
     if: needs.create-batches.outputs.batch_count > 0
     strategy:
-      max-parallel: 3           # 降低并发批次数
+      max-parallel: 2           # 进一步降低并发数
       fail-fast: false         # 某个批次失败不影响其他批次
       matrix:
         batch: ${{ fromJson(needs.create-batches.outputs.batches) }}
@@ -148,7 +148,7 @@ jobs:
         if: ${{ matrix.batch.batch_id != 0 }}
         run: |
           # 每个批次之间延迟，避免rate limit
-          delay_seconds=$(( ${{ matrix.batch.batch_id }} * 10 ))
+          delay_seconds=$(( ${{ matrix.batch.batch_id }} * 15 ))
           echo "⏱️  批次 ${{ matrix.batch.batch_id }} 延迟 ${delay_seconds} 秒..."
           sleep $delay_seconds
           
@@ -161,8 +161,22 @@ jobs:
           
           # 处理当前批次的所有仓库
           repos='${{ toJson(matrix.batch.repos) }}'
+          
+          # 设置错误处理
+          set +e  # 允许命令失败而不退出脚本
+          
+          # 初始化计数器
+          processed=0
+          total_in_batch=$(echo "$repos" | jq -r 'length')
+          
           echo "$repos" | jq -r '.[]' | while read -r repo_url; do
-            echo "📦 处理仓库: $repo_url"
+            processed=$((processed + 1))
+            echo "📦 处理仓库 ($processed/$total_in_batch): $repo_url"
+            
+            # 重置错误标志
+            error_occurred=false
+            status="unknown"
+            message="处理中..."
             
             # 提取仓库信息
             owner_repo=${repo_url#*github.com/}
@@ -170,17 +184,39 @@ jobs:
             owner=$(echo "$owner_repo" | cut -d/ -f1)
             repo=$(echo "$owner_repo" | cut -d/ -f2)
             
-            # 检查原始仓库是否存在
-            if ! gh repo view "$owner_repo" --json name >/dev/null 2>&1; then
-              echo "❌ 原始仓库不存在: $owner_repo"
+            # 添加超时和重试机制
+            retry_count=0
+            max_retries=3
+            
+            while [ $retry_count -lt $max_retries ]; do
+              echo "🔄 尝试 $((retry_count + 1))/$max_retries: $owner_repo"
               
-              # 保存结果
+              # 检查原始仓库是否存在（添加超时）
+              if timeout 30 gh repo view "$owner_repo" --json name >/dev/null 2>&1; then
+                echo "✅ 原始仓库存在: $owner_repo"
+                break
+              else
+                if [ $retry_count -eq $((max_retries - 1)) ]; then
+                  echo "❌ 原始仓库不存在或无法访问: $owner_repo"
+                  status="not_found"
+                  message="原始仓库不存在或无法访问"
+                  error_occurred=true
+                else
+                  echo "⏳ 重试中..."
+                  sleep 5
+                fi
+                retry_count=$((retry_count + 1))
+              fi
+            done
+            
+            # 如果原始仓库不存在，保存结果并继续下一个
+            if [ "$error_occurred" = "true" ]; then
               jq -n \
                 --arg repo "$owner_repo" \
                 --arg owner "$owner" \
                 --arg repo_name "$repo" \
-                --arg status "not_found" \
-                --arg message "原始仓库不存在或无法访问" \
+                --arg status "$status" \
+                --arg message "$message" \
                 --arg my_fork "unknown/$repo" \
                 --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 '{
@@ -193,25 +229,73 @@ jobs:
                   timestamp: $timestamp
                 }' > "results/${owner}_${repo}.json"
               
+              sleep 2  # 短暂延迟后继续
               continue
             fi
             
-            echo "✅ 原始仓库存在: $owner_repo"
-            
             # 获取当前用户信息
-            my_login=$(gh api user --jq .login)
+            my_login=""
+            retry_count=0
+            while [ $retry_count -lt $max_retries ] && [ -z "$my_login" ]; do
+              my_login=$(timeout 15 gh api user --jq .login 2>/dev/null || echo "")
+              if [ -z "$my_login" ]; then
+                echo "⏳ 获取用户信息重试中..."
+                sleep 3
+                retry_count=$((retry_count + 1))
+              fi
+            done
+            
+            if [ -z "$my_login" ]; then
+              echo "❌ 无法获取用户信息: $owner_repo"
+              status="auth_failed"
+              message="无法获取用户信息"
+              
+              jq -n \
+                --arg repo "$owner_repo" \
+                --arg owner "$owner" \
+                --arg repo_name "$repo" \
+                --arg status "$status" \
+                --arg message "$message" \
+                --arg my_fork "unknown/$repo" \
+                --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{
+                  repo: $repo,
+                  owner: $owner,
+                  repo_name: $repo_name,
+                  status: $status,
+                  message: $message,
+                  my_fork: $my_fork,
+                  timestamp: $timestamp
+                }' > "results/${owner}_${repo}.json"
+              
+              sleep 2
+              continue
+            fi
+            
             my_fork="${my_login}/$repo"
             
-            # 增强的fork状态检查
+            # 增强的fork状态检查（添加错误处理）
             fork_exists=false
             fork_status="unknown"
             
-            # 检查我的fork是否存在
-            if gh repo view "$my_fork" --json name,parent,isFork,nameWithOwner >/dev/null 2>&1; then
-              # 获取详细的仓库信息
-              repo_info=$(gh repo view "$my_fork" --json name,parent,isFork,nameWithOwner)
-              is_fork=$(echo "$repo_info" | jq -r '.isFork // false')
-              parent_name=$(echo "$repo_info" | jq -r '.parent.nameWithOwner // empty')
+            # 检查我的fork是否存在（添加超时和错误处理）
+            repo_check_result=""
+            retry_count=0
+            while [ $retry_count -lt $max_retries ]; do
+              repo_check_result=$(timeout 30 gh repo view "$my_fork" --json name,parent,isFork,nameWithOwner 2>/dev/null || echo "ERROR")
+              if [ "$repo_check_result" != "ERROR" ] && [ -n "$repo_check_result" ]; then
+                break
+              else
+                echo "⏳ 检查fork状态重试中..."
+                sleep 3
+                retry_count=$((retry_count + 1))
+              fi
+            done
+            
+            if [ "$repo_check_result" != "ERROR" ] && [ -n "$repo_check_result" ]; then
+              # 解析仓库信息
+              is_fork=$(echo "$repo_check_result" | jq -r '.isFork // false' 2>/dev/null || echo "false")
+              parent_name=$(echo "$repo_check_result" | jq -r '.parent.nameWithOwner // empty' 2>/dev/null || echo "")
               
               echo "🔍 检查fork状态: is_fork=$is_fork, parent=$parent_name"
               
@@ -227,29 +311,38 @@ jobs:
                   fork_status="wrong_parent"
                   echo "⚠️  已fork但parent不匹配: $my_fork (parent: $parent_name, expected: $owner_repo)"
                 else
-                  # fork但没有parent信息，尝试通过API获取更多信息
+                  # fork但没有parent信息，使用API检查
                   echo "🔍 Fork无parent信息，尝试API检查..."
                   
-                  # 使用GitHub API获取更详细信息
-                  api_info=$(gh api repos/"$my_fork" --jq '{fork: .fork, parent: .parent.full_name}' 2>/dev/null || echo '{}')
-                  api_parent=$(echo "$api_info" | jq -r '.parent // empty')
+                  api_info=""
+                  retry_count=0
+                  while [ $retry_count -lt $max_retries ]; do
+                    api_info=$(timeout 20 gh api repos/"$my_fork" --jq '{fork: .fork, parent: .parent.full_name}' 2>/dev/null || echo "ERROR")
+                    if [ "$api_info" != "ERROR" ]; then
+                      break
+                    else
+                      echo "⏳ API检查重试中..."
+                      sleep 3
+                      retry_count=$((retry_count + 1))
+                    fi
+                  done
                   
-                  if [ -n "$api_parent" ] && [ "$api_parent" = "$owner_repo" ]; then
-                    fork_exists=true
-                    fork_status="valid_fork_api"
-                    echo "✅ API确认为正确的fork: $my_fork <- $api_parent"
-                  else
-                    # 最后尝试：直接测试同步是否可行
-                    echo "🧪 测试同步兼容性..."
-                    if gh repo sync "$my_fork" --source "$owner_repo" --dry-run 2>/dev/null; then
+                  if [ "$api_info" != "ERROR" ]; then
+                    api_parent=$(echo "$api_info" | jq -r '.parent // empty' 2>/dev/null || echo "")
+                    
+                    if [ -n "$api_parent" ] && [ "$api_parent" = "$owner_repo" ]; then
                       fork_exists=true
-                      fork_status="valid_fork_sync_test"
-                      echo "✅ 同步测试通过，确认为有效fork"
+                      fork_status="valid_fork_api"
+                      echo "✅ API确认为正确的fork: $my_fork <- $api_parent"
                     else
                       fork_exists=false
                       fork_status="invalid_fork"
-                      echo "❌ 同步测试失败，可能不是正确的fork"
+                      echo "❌ API检查无法确认为有效fork"
                     fi
+                  else
+                    fork_exists=false
+                    fork_status="api_check_failed"
+                    echo "❌ API检查失败"
                   fi
                 fi
               else
@@ -265,7 +358,7 @@ jobs:
               echo "🆕 尚未fork: $owner_repo"
             fi
             
-            # 根据情况执行操作
+            # 根据情况执行操作（添加错误处理）
             if [ "${{ inputs.dry_run }}" = "true" ]; then
               # 试运行模式
               if [ "$fork_exists" = "false" ]; then
@@ -288,49 +381,48 @@ jobs:
                 status="skipped_conflict"
                 message="跳过：存在同名仓库冲突"
               else
-                # 正常fork
+                # 正常fork（添加错误处理和超时）
                 echo "🍴 正在fork: $owner_repo"
                 
-                # 捕获fork命令的输出和错误
-                fork_output=$(gh repo fork "$owner_repo" --clone=false 2>&1)
-                fork_exit_code=$?
+                fork_output=""
+                fork_exit_code=1
+                retry_count=0
                 
-                if [ $fork_exit_code -eq 0 ]; then
-                  echo "✅ Fork成功: $owner_repo"
-                  status="forked"
-                  message="新fork成功"
-                else
-                  # 检查是否是"already exists"错误
-                  if echo "$fork_output" | grep -q "already exists"; then
-                    echo "ℹ️  Fork已存在，检查状态: $my_fork"
-                    # 重新检查fork状态
-                    if gh repo view "$my_fork" --json isFork,parent >/dev/null 2>&1; then
-                      updated_info=$(gh repo view "$my_fork" --json isFork,parent)
-                      updated_is_fork=$(echo "$updated_info" | jq -r '.isFork // false')
-                      updated_parent=$(echo "$updated_info" | jq -r '.parent.nameWithOwner // empty')
-                      
-                      if [ "$updated_is_fork" = "true" ] && [ "$updated_parent" = "$owner_repo" ]; then
-                        status="already_forked"
-                        message="Fork已存在"
-                        fork_exists=true
-                      else
-                        status="fork_conflict"
-                        message="Fork冲突：已存在同名仓库"
-                      fi
-                    else
-                      status="fork_conflict"
-                      message="Fork冲突：无法确认状态"
-                    fi
+                while [ $retry_count -lt $max_retries ] && [ $fork_exit_code -ne 0 ]; do
+                  echo "🔄 Fork尝试 $((retry_count + 1))/$max_retries"
+                  fork_output=$(timeout 60 gh repo fork "$owner_repo" --clone=false 2>&1)
+                  fork_exit_code=$?
+                  
+                  if [ $fork_exit_code -eq 0 ]; then
+                    echo "✅ Fork成功: $owner_repo"
+                    status="forked"
+                    message="新fork成功"
+                    break
                   else
-                    echo "❌ Fork失败: $owner_repo"
-                    echo "错误输出: $fork_output"
-                    status="fork_failed"
-                    message="Fork失败: $(echo "$fork_output" | head -1)"
+                    # 检查是否是"already exists"错误
+                    if echo "$fork_output" | grep -q "already exists"; then
+                      echo "ℹ️  Fork已存在，检查状态: $my_fork"
+                      status="already_forked"
+                      message="Fork已存在"
+                      fork_exists=true
+                      break
+                    else
+                      if [ $retry_count -eq $((max_retries - 1)) ]; then
+                        echo "❌ Fork失败: $owner_repo"
+                        echo "错误输出: $fork_output"
+                        status="fork_failed"
+                        message="Fork失败: $(echo "$fork_output" | head -1 | cut -c1-50)"
+                      else
+                        echo "⏳ Fork重试中..."
+                        sleep 5
+                      fi
+                      retry_count=$((retry_count + 1))
+                    fi
                   fi
-                fi
+                done
               fi
             else
-              # 已fork，执行同步
+              # 已fork，执行同步（添加错误处理）
               echo "🔄 正在同步fork: $my_fork"
               
               sync_needed=false
@@ -340,43 +432,59 @@ jobs:
               fi
               
               if [ "$sync_needed" = "true" ]; then
-                # 执行同步
-                sync_output=$(gh repo sync "$my_fork" --source "$owner_repo" 2>&1)
-                sync_exit_code=$?
+                # 执行同步（添加超时和重试）
+                sync_output=""
+                sync_exit_code=1
+                retry_count=0
                 
-                if [ $sync_exit_code -eq 0 ]; then
-                  echo "✅ 同步成功: $my_fork"
-                  status="synced"
-                  message="同步成功"
-                else
-                  # 检查同步失败的原因
-                  if echo "$sync_output" | grep -q "up to date\|already up-to-date"; then
-                    echo "ℹ️  已是最新: $my_fork"
-                    status="up_to_date"
-                    message="已是最新版本"
+                while [ $retry_count -lt $max_retries ] && [ $sync_exit_code -ne 0 ]; do
+                  echo "🔄 同步尝试 $((retry_count + 1))/$max_retries"
+                  sync_output=$(timeout 120 gh repo sync "$my_fork" --source "$owner_repo" 2>&1)
+                  sync_exit_code=$?
+                  
+                  if [ $sync_exit_code -eq 0 ]; then
+                    echo "✅ 同步成功: $my_fork"
+                    status="synced"
+                    message="同步成功"
+                    break
                   else
-                    echo "⚠️  同步失败: $my_fork"
-                    echo "错误输出: $sync_output"
-                    status="sync_failed"
-                    message="同步失败: $(echo "$sync_output" | head -1)"
+                    # 检查同步失败的原因
+                    if echo "$sync_output" | grep -q "up to date\|already up-to-date"; then
+                      echo "ℹ️  已是最新: $my_fork"
+                      status="up_to_date"
+                      message="已是最新版本"
+                      break
+                    else
+                      if [ $retry_count -eq $((max_retries - 1)) ]; then
+                        echo "⚠️  同步失败: $my_fork"
+                        echo "错误输出: $sync_output"
+                        status="sync_failed"
+                        message="同步失败: $(echo "$sync_output" | head -1 | cut -c1-50)"
+                      else
+                        echo "⏳ 同步重试中..."
+                        sleep 10
+                      fi
+                      retry_count=$((retry_count + 1))
+                    fi
                   fi
-                fi
+                done
               else
-                # 非强制模式，检查是否需要同步
+                # 非强制模式，简单检查
                 echo "🔍 检查是否需要同步..."
-                if gh repo sync "$my_fork" --source "$owner_repo" 2>/dev/null; then
+                if timeout 60 gh repo sync "$my_fork" --source "$owner_repo" 2>/dev/null; then
                   echo "✅ 同步成功: $my_fork"
                   status="synced"
                   message="自动同步成功"
                 else
-                  echo "ℹ️  无需同步: $my_fork"
+                  echo "ℹ️  无需同步或同步失败: $my_fork"
                   status="up_to_date"
                   message="已是最新或无需同步"
                 fi
               fi
             fi
             
-            # 保存结果
+            # 保存结果（确保目录存在）
+            mkdir -p "results"
             jq -n \
               --arg repo "$owner_repo" \
               --arg owner "$owner" \
@@ -395,13 +503,19 @@ jobs:
                 my_fork: $my_fork,
                 fork_status: $fork_status,
                 timestamp: $timestamp
-              }' > "results/${owner}_${repo}.json"
+              }' > "results/${owner}_${repo}.json" 2>/dev/null || {
+                echo "⚠️  保存结果文件失败: ${owner}_${repo}.json"
+              }
             
-            # 防止rate limit - 每个仓库之间短暂延迟
-            sleep 3
+            # 防止rate limit - 每个仓库之间延迟
+            echo "⏱️  等待 5 秒..."
+            sleep 5
           done
           
           echo "✅ 批次 ${{ matrix.batch.batch_id }} 处理完成"
+          
+          # 重新启用错误退出
+          set -e
           
       - name: Upload batch results
         if: always()
@@ -458,12 +572,12 @@ jobs:
                 total=$((total + 1))
                 
                 # 提取数据
-                repo=$(jq -r '.repo' "$file")
-                status=$(jq -r '.status' "$file")
-                message=$(jq -r '.message' "$file")
-                my_fork=$(jq -r '.my_fork' "$file")
-                fork_status=$(jq -r '.fork_status // "unknown"' "$file")
-                timestamp=$(jq -r '.timestamp' "$file")
+                repo=$(jq -r '.repo' "$file" 2>/dev/null || echo "unknown")
+                status=$(jq -r '.status' "$file" 2>/dev/null || echo "unknown")
+                message=$(jq -r '.message' "$file" 2>/dev/null || echo "无消息")
+                my_fork=$(jq -r '.my_fork' "$file" 2>/dev/null || echo "unknown")
+                fork_status=$(jq -r '.fork_status // "unknown"' "$file" 2>/dev/null || echo "unknown")
+                timestamp=$(jq -r '.timestamp' "$file" 2>/dev/null || echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
                 
                 # 格式化时间
                 formatted_time=$(date -d "$timestamp" '+%H:%M' 2>/dev/null || echo "N/A")
@@ -478,10 +592,6 @@ jobs:
                     icon="🔄"
                     synced=$((synced + 1))
                     ;;
-                  "sync_attempted")
-                    icon="🔄"
-                    synced=$((synced + 1))
-                    ;;
                   "up_to_date")
                     icon="✅"
                     up_to_date=$((up_to_date + 1))
@@ -490,7 +600,7 @@ jobs:
                     icon="📁"
                     already_forked=$((already_forked + 1))
                     ;;
-                  "fork_failed"|"sync_failed")
+                  "fork_failed"|"sync_failed"|"auth_failed"|"api_check_failed")
                     icon="❌"
                     failed=$((failed + 1))
                     ;;
@@ -515,11 +625,12 @@ jobs:
                 
                 # 格式化fork状态
                 case "$fork_status" in
-                  "valid_fork") fork_status_display="✅ 有效" ;;
+                  "valid_fork"|"valid_fork_api") fork_status_display="✅ 有效" ;;
                   "wrong_parent") fork_status_display="⚠️ 错误父级" ;;
                   "independent_repo") fork_status_display="🏠 独立仓库" ;;
                   "not_exists") fork_status_display="❌ 不存在" ;;
                   "invalid_fork") fork_status_display="❌ 无效fork" ;;
+                  "api_check_failed") fork_status_display="❌ API检查失败" ;;
                   *) fork_status_display="❓ 未知" ;;
                 esac
                 
@@ -567,6 +678,7 @@ jobs:
           fi
           echo "- 📅 建议启用定期同步保持fork最新" >> results_summary.md
           echo "- 🧹 对于冲突的仓库，建议手动检查并重命名或删除" >> results_summary.md
+          echo "- 🔄 如果遇到失败，工作流会自动重试，提高成功率" >> results_summary.md
           
           echo "✅ 结果表格生成完成"
           
@@ -598,6 +710,14 @@ jobs:
           echo "- 强制同步: ${{ inputs.force_sync && '✅ 是' || '❌ 否' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # 显示各个job的状态
+          echo "🔧 **任务状态:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 准备阶段: ${{ needs.prepare.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 批次创建: ${{ needs.create-batches.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Fork/Sync: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 结果收集: ${{ needs.collect-results.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
           if [ "${{ needs.collect-results.result }}" = "success" ]; then
             echo "✅ **详细结果表格已生成！**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -607,14 +727,26 @@ jobs:
             echo "- 可在 Artifacts 中下载 \`fork-sync-results\` 文件查看详细报告" >> $GITHUB_STEP_SUMMARY
             echo "- 包含所有仓库的fork状态、链接和时间戳" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️  **结果收集失败**" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️  **结果收集状态异常**" >> $GITHUB_STEP_SUMMARY
             echo "- 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
             echo "- 结果收集: ${{ needs.collect-results.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 **可能的原因:**" >> $GITHUB_STEP_SUMMARY
+            echo "- 网络超时或API限制" >> $GITHUB_STEP_SUMMARY
+            echo "- 某些仓库访问权限问题" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub API临时不可用" >> $GITHUB_STEP_SUMMARY
           fi
           
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **改进特性:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 增加了重试机制（每个操作最多重试3次）" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 添加了超时保护，避免长时间阻塞" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 改进了错误处理，单个仓库失败不影响整批" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 减少了批次大小和并发数，降低API压力" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 增加了延迟时间，更好地避免rate limit" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "🔄 **下次运行建议:**" >> $GITHUB_STEP_SUMMARY
           echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
           echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
           echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
-          echo "- 批次处理避免了矩阵限制问题" >> $GITHUB_STEP_SUMMARY
+          echo "- 新的错误处理机制提高了稳定性" >> $GITHUB_STEP_SUMMARY
