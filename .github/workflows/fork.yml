@@ -13,6 +13,15 @@ on:
         required: false
         default: false
         type: boolean
+      conflict_resolution:
+        description: '重名冲突解决策略'
+        required: false
+        default: 'rename'
+        type: choice
+        options:
+          - 'skip'           # 跳过冲突仓库
+          - 'rename'         # 自动重命名fork
+          - 'interactive'    # 记录冲突待手动处理
   schedule:                   # 每小时 UTC 自动同步
     - cron: "0 * * * *"
 
@@ -159,6 +168,10 @@ jobs:
           # 创建结果目录
           mkdir -p results
           
+          # 获取冲突解决策略
+          CONFLICT_STRATEGY="${{ inputs.conflict_resolution || 'rename' }}"
+          echo "🎯 冲突解决策略: $CONFLICT_STRATEGY"
+          
           # 处理当前批次的所有仓库
           repos='${{ toJson(matrix.batch.repos) }}'
           
@@ -169,6 +182,46 @@ jobs:
           processed=0
           total_in_batch=$(echo "$repos" | jq -r 'length')
           
+          # 自动重命名函数
+          find_available_name() {
+            local base_name="$1"
+            local my_login="$2"
+            local suffix_counter=1
+            local candidate_name
+            
+            # 尝试不同的命名策略
+            local naming_strategies=(
+              "${base_name}-astrbot"
+              "${base_name}-fork" 
+              "${base_name}-plugin"
+              "astrbot-${base_name}"
+            )
+            
+            # 首先尝试预定义的策略
+            for strategy in "${naming_strategies[@]}"; do
+              if ! timeout 20 gh repo view "${my_login}/${strategy}" >/dev/null 2>&1; then
+                echo "$strategy"
+                return 0
+              fi
+            done
+            
+            # 如果预定义策略都被占用，使用数字后缀
+            while true; do
+              candidate_name="${base_name}-astrbot-${suffix_counter}"
+              if ! timeout 20 gh repo view "${my_login}/${candidate_name}" >/dev/null 2>&1; then
+                echo "$candidate_name"
+                return 0
+              fi
+              suffix_counter=$((suffix_counter + 1))
+              
+              # 防止无限循环
+              if [ $suffix_counter -gt 100 ]; then
+                echo "${base_name}-$(date +%s)"
+                return 0
+              fi
+            done
+          }
+          
           echo "$repos" | jq -r '.[]' | while read -r repo_url; do
             processed=$((processed + 1))
             echo "📦 处理仓库 ($processed/$total_in_batch): $repo_url"
@@ -177,6 +230,8 @@ jobs:
             error_occurred=false
             status="unknown"
             message="处理中..."
+            final_fork_name=""
+            renamed=false
             
             # 提取仓库信息
             owner_repo=${repo_url#*github.com/}
@@ -218,6 +273,8 @@ jobs:
                 --arg status "$status" \
                 --arg message "$message" \
                 --arg my_fork "unknown/$repo" \
+                --arg final_name "$repo" \
+                --argjson renamed false \
                 --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 '{
                   repo: $repo,
@@ -226,6 +283,8 @@ jobs:
                   status: $status,
                   message: $message,
                   my_fork: $my_fork,
+                  final_fork_name: $final_name,
+                  renamed: $renamed,
                   timestamp: $timestamp
                 }' > "results/${owner}_${repo}.json"
               
@@ -257,6 +316,8 @@ jobs:
                 --arg status "$status" \
                 --arg message "$message" \
                 --arg my_fork "unknown/$repo" \
+                --arg final_name "$repo" \
+                --argjson renamed false \
                 --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 '{
                   repo: $repo,
@@ -265,6 +326,8 @@ jobs:
                   status: $status,
                   message: $message,
                   my_fork: $my_fork,
+                  final_fork_name: $final_name,
+                  renamed: $renamed,
                   timestamp: $timestamp
                 }' > "results/${owner}_${repo}.json"
               
@@ -273,6 +336,7 @@ jobs:
             fi
             
             my_fork="${my_login}/$repo"
+            final_fork_name="$repo"  # 默认使用原名
             
             # 增强的fork状态检查（添加错误处理）
             fork_exists=false
@@ -358,13 +422,28 @@ jobs:
               echo "🆕 尚未fork: $owner_repo"
             fi
             
-            # 根据情况执行操作（添加错误处理）
+            # 根据情况执行操作（添加错误处理和自动重命名）
             if [ "${{ inputs.dry_run }}" = "true" ]; then
               # 试运行模式
               if [ "$fork_exists" = "false" ]; then
                 if [ "$fork_status" = "wrong_parent" ] || [ "$fork_status" = "independent_repo" ]; then
-                  status="conflict_detected"
-                  message="检测到同名仓库冲突，需要手动处理"
+                  case "$CONFLICT_STRATEGY" in
+                    "rename")
+                      available_name=$(find_available_name "$repo" "$my_login")
+                      final_fork_name="$available_name"
+                      renamed=true
+                      status="will_fork_renamed"
+                      message="将会fork为: $available_name"
+                      ;;
+                    "skip")
+                      status="conflict_detected"
+                      message="检测到同名仓库冲突，将跳过"
+                      ;;
+                    "interactive")
+                      status="conflict_pending"
+                      message="检测到冲突，待手动处理"
+                      ;;
+                  esac
                 else
                   status="will_fork"
                   message="将会fork"
@@ -376,10 +455,67 @@ jobs:
             elif [ "$fork_exists" = "false" ]; then
               # 需要fork
               if [ "$fork_status" = "wrong_parent" ] || [ "$fork_status" = "independent_repo" ]; then
-                # 存在冲突，跳过
-                echo "⚠️  跳过fork，存在同名仓库: $my_fork"
-                status="skipped_conflict"
-                message="跳过：存在同名仓库冲突"
+                # 存在冲突，根据策略处理
+                case "$CONFLICT_STRATEGY" in
+                  "rename")
+                    echo "🏷️  检测到重名冲突，启用自动重命名..."
+                    
+                    # 查找可用的名称
+                    available_name=$(find_available_name "$repo" "$my_login")
+                    echo "🎯 找到可用名称: $available_name"
+                    
+                    # 使用新名称fork
+                    echo "🍴 正在fork为新名称: $owner_repo -> ${my_login}/${available_name}"
+                    
+                    fork_output=""
+                    fork_exit_code=1
+                    retry_count=0
+                    
+                    while [ $retry_count -lt $max_retries ] && [ $fork_exit_code -ne 0 ]; do
+                      echo "🔄 重命名Fork尝试 $((retry_count + 1))/$max_retries"
+                      fork_output=$(timeout 60 gh repo fork "$owner_repo" --repo-name "$available_name" --clone=false 2>&1)
+                      fork_exit_code=$?
+                      
+                      if [ $fork_exit_code -eq 0 ]; then
+                        echo "✅ 重命名Fork成功: $owner_repo -> ${my_login}/${available_name}"
+                        status="forked_renamed"
+                        message="重命名fork成功: $available_name"
+                        final_fork_name="$available_name"
+                        my_fork="${my_login}/${available_name}"
+                        renamed=true
+                        break
+                      else
+                        # 检查是否是名称仍然冲突
+                        if echo "$fork_output" | grep -q "already exists"; then
+                          echo "⚠️  名称 $available_name 仍然冲突，寻找新名称..."
+                          available_name=$(find_available_name "$repo" "$my_login")
+                          echo "🎯 重新找到可用名称: $available_name"
+                        else
+                          if [ $retry_count -eq $((max_retries - 1)) ]; then
+                            echo "❌ 重命名Fork失败: $owner_repo"
+                            echo "错误输出: $fork_output"
+                            status="fork_rename_failed"
+                            message="重命名fork失败: $(echo "$fork_output" | head -1 | cut -c1-50)"
+                          else
+                            echo "⏳ 重命名Fork重试中..."
+                            sleep 5
+                          fi
+                          retry_count=$((retry_count + 1))
+                        fi
+                      fi
+                    done
+                    ;;
+                  "skip")
+                    echo "⚠️  跳过fork，存在同名仓库: $my_fork"
+                    status="skipped_conflict"
+                    message="跳过：存在同名仓库冲突"
+                    ;;
+                  "interactive")
+                    echo "🤔 记录冲突待手动处理: $my_fork"
+                    status="conflict_pending"
+                    message="冲突待手动处理：存在同名仓库"
+                    ;;
+                esac
               else
                 # 正常fork（添加错误处理和超时）
                 echo "🍴 正在fork: $owner_repo"
@@ -492,7 +628,10 @@ jobs:
               --arg status "$status" \
               --arg message "$message" \
               --arg my_fork "$my_fork" \
+              --arg final_name "$final_fork_name" \
+              --argjson renamed "$renamed" \
               --arg fork_status "$fork_status" \
+              --arg conflict_strategy "$CONFLICT_STRATEGY" \
               --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{
                 repo: $repo,
@@ -501,7 +640,10 @@ jobs:
                 status: $status,
                 message: $message,
                 my_fork: $my_fork,
+                final_fork_name: $final_name,
+                renamed: $renamed,
                 fork_status: $fork_status,
+                conflict_strategy: $conflict_strategy,
                 timestamp: $timestamp
               }' > "results/${owner}_${repo}.json" 2>/dev/null || {
                 echo "⚠️  保存结果文件失败: ${owner}_${repo}.json"
@@ -546,24 +688,27 @@ jobs:
           echo "" >> results_summary.md
           echo "**操作时间:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> results_summary.md
           echo "**操作模式:** ${{ inputs.dry_run && '🔍 试运行' || '▶️ 实际执行' }}" >> results_summary.md
+          echo "**冲突策略:** ${{ inputs.conflict_resolution || 'rename' }}" >> results_summary.md
           echo "**总仓库数:** ${{ needs.prepare.outputs.total_count }}" >> results_summary.md
           echo "" >> results_summary.md
           
           # 统计各种状态
           total=0
           forked=0
+          forked_renamed=0
           synced=0
           up_to_date=0
           already_forked=0
           failed=0
           not_found=0
           conflicts=0
+          renamed_count=0
           
           # 创建表格头
           echo "## 📋 详细结果" >> results_summary.md
           echo "" >> results_summary.md
-          echo "| 仓库 | 状态 | 我的Fork | 说明 | Fork状态 | 时间 |" >> results_summary.md
-          echo "|------|------|----------|------|----------|------|" >> results_summary.md
+          echo "| 仓库 | 状态 | 我的Fork | Fork名称 | 重命名 | 说明 | Fork状态 | 时间 |" >> results_summary.md
+          echo "|------|------|----------|----------|--------|------|----------|------|" >> results_summary.md
           
           # 处理所有结果文件
           if [ -d "all-results" ]; then
@@ -576,17 +721,28 @@ jobs:
                 status=$(jq -r '.status' "$file" 2>/dev/null || echo "unknown")
                 message=$(jq -r '.message' "$file" 2>/dev/null || echo "无消息")
                 my_fork=$(jq -r '.my_fork' "$file" 2>/dev/null || echo "unknown")
+                final_name=$(jq -r '.final_fork_name // .repo_name' "$file" 2>/dev/null || echo "unknown")
+                renamed=$(jq -r '.renamed // false' "$file" 2>/dev/null || echo "false")
                 fork_status=$(jq -r '.fork_status // "unknown"' "$file" 2>/dev/null || echo "unknown")
                 timestamp=$(jq -r '.timestamp' "$file" 2>/dev/null || echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
                 
                 # 格式化时间
                 formatted_time=$(date -d "$timestamp" '+%H:%M' 2>/dev/null || echo "N/A")
                 
+                # 统计重命名
+                if [ "$renamed" = "true" ]; then
+                  renamed_count=$((renamed_count + 1))
+                fi
+                
                 # 状态图标和统计
                 case "$status" in
                   "forked")
                     icon="🍴"
                     forked=$((forked + 1))
+                    ;;
+                  "forked_renamed")
+                    icon="🏷️"
+                    forked_renamed=$((forked_renamed + 1))
                     ;;
                   "synced")
                     icon="🔄"
@@ -600,7 +756,7 @@ jobs:
                     icon="📁"
                     already_forked=$((already_forked + 1))
                     ;;
-                  "fork_failed"|"sync_failed"|"auth_failed"|"api_check_failed")
+                  "fork_failed"|"fork_rename_failed"|"sync_failed"|"auth_failed"|"api_check_failed")
                     icon="❌"
                     failed=$((failed + 1))
                     ;;
@@ -608,12 +764,15 @@ jobs:
                     icon="🚫"
                     not_found=$((not_found + 1))
                     ;;
-                  "skipped_conflict"|"fork_conflict"|"conflict_detected")
+                  "skipped_conflict"|"conflict_detected"|"conflict_pending")
                     icon="⚠️"
                     conflicts=$((conflicts + 1))
                     ;;
                   "will_fork")
                     icon="🔮"
+                    ;;
+                  "will_fork_renamed")
+                    icon="🔮🏷️"
                     ;;
                   "will_sync")
                     icon="🔮"
@@ -634,8 +793,16 @@ jobs:
                   *) fork_status_display="❓ 未知" ;;
                 esac
                 
+                # 重命名状态
+                rename_display=""
+                if [ "$renamed" = "true" ]; then
+                  rename_display="✅ 是"
+                else
+                  rename_display="❌ 否"
+                fi
+                
                 # 添加到表格
-                echo "| [\`$repo\`](https://github.com/$repo) | $icon $message | [\`$my_fork\`](https://github.com/$my_fork) | $message | $fork_status_display | $formatted_time |" >> results_summary.md
+                echo "| [\`$repo\`](https://github.com/$repo) | $icon $status | [\`$my_fork\`](https://github.com/$my_fork) | \`$final_name\` | $rename_display | $message | $fork_status_display | $formatted_time |" >> results_summary.md
               fi
             done
           fi
@@ -649,6 +816,7 @@ jobs:
           
           if [ $total -gt 0 ]; then
             [ $forked -gt 0 ] && echo "| 🍴 新fork成功 | $forked | $(( forked * 100 / total ))% |" >> results_summary.md
+            [ $forked_renamed -gt 0 ] && echo "| 🏷️ 重命名fork成功 | $forked_renamed | $(( forked_renamed * 100 / total ))% |" >> results_summary.md
             [ $synced -gt 0 ] && echo "| 🔄 同步成功 | $synced | $(( synced * 100 / total ))% |" >> results_summary.md
             [ $up_to_date -gt 0 ] && echo "| ✅ 已是最新 | $up_to_date | $(( up_to_date * 100 / total ))% |" >> results_summary.md
             [ $already_forked -gt 0 ] && echo "| 📁 已fork(未同步) | $already_forked | $(( already_forked * 100 / total ))% |" >> results_summary.md
@@ -659,6 +827,38 @@ jobs:
           
           echo "" >> results_summary.md
           echo "**总计:** $total 个仓库" >> results_summary.md
+          echo "**自动重命名:** $renamed_count 个仓库" >> results_summary.md
+          
+          # 添加重命名详情
+          if [ $renamed_count -gt 0 ]; then
+            echo "" >> results_summary.md
+            echo "## 🏷️ 重命名详情" >> results_summary.md
+            echo "" >> results_summary.md
+            echo "| 原始仓库 | 原名称 | 新名称 | 原因 |" >> results_summary.md
+            echo "|----------|--------|--------|------|" >> results_summary.md
+            
+            for file in all-results/*.json; do
+              if [ -f "$file" ]; then
+                renamed_check=$(jq -r '.renamed // false' "$file" 2>/dev/null || echo "false")
+                if [ "$renamed_check" = "true" ]; then
+                  repo=$(jq -r '.repo' "$file" 2>/dev/null || echo "unknown")
+                  repo_name=$(jq -r '.repo_name' "$file" 2>/dev/null || echo "unknown")
+                  final_name=$(jq -r '.final_fork_name' "$file" 2>/dev/null || echo "unknown")
+                  fork_status=$(jq -r '.fork_status' "$file" 2>/dev/null || echo "unknown")
+                  
+                  reason=""
+                  case "$fork_status" in
+                    "wrong_parent") reason="错误的父级仓库" ;;
+                    "independent_repo") reason="存在同名独立仓库" ;;
+                    "invalid_fork") reason="无效的fork" ;;
+                    *) reason="名称冲突" ;;
+                  esac
+                  
+                  echo "| [\`$repo\`](https://github.com/$repo) | \`$repo_name\` | \`$final_name\` | $reason |" >> results_summary.md
+                fi
+              fi
+            done
+          fi
           
           # 添加建议
           echo "" >> results_summary.md
@@ -668,7 +868,7 @@ jobs:
             echo "- ⚠️  有 $failed 个仓库操作失败，建议检查权限或网络问题" >> results_summary.md
           fi
           if [ $conflicts -gt 0 ]; then
-            echo "- ⚠️  有 $conflicts 个仓库存在冲突，需要手动处理同名仓库" >> results_summary.md
+            echo "- ⚠️  有 $conflicts 个仓库存在冲突，请检查冲突策略设置" >> results_summary.md
           fi
           if [ $not_found -gt 0 ]; then
             echo "- 🔍 有 $not_found 个仓库不存在，可能已被删除或移动" >> results_summary.md
@@ -676,9 +876,14 @@ jobs:
           if [ $already_forked -gt 0 ]; then
             echo "- 🔄 有 $already_forked 个已fork仓库未同步，可使用'强制同步'选项更新" >> results_summary.md
           fi
+          if [ $renamed_count -gt 0 ]; then
+            echo "- 🏷️  自动重命名了 $renamed_count 个fork，避免了名称冲突" >> results_summary.md
+            echo "- 📝 重命名的仓库使用了后缀如 '-astrbot', '-fork', '-plugin' 等" >> results_summary.md
+          fi
           echo "- 📅 建议启用定期同步保持fork最新" >> results_summary.md
-          echo "- 🧹 对于冲突的仓库，建议手动检查并重命名或删除" >> results_summary.md
+          echo "- 🧹 自动重命名功能可以避免大部分冲突问题" >> results_summary.md
           echo "- 🔄 如果遇到失败，工作流会自动重试，提高成功率" >> results_summary.md
+          echo "- ⚙️  可以调整冲突策略：'rename'(自动重命名)、'skip'(跳过)、'interactive'(待处理)" >> results_summary.md
           
           echo "✅ 结果表格生成完成"
           
@@ -708,6 +913,7 @@ jobs:
           echo "- 批次数量: ${{ needs.create-batches.outputs.batch_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- 操作模式: ${{ inputs.dry_run && '🔍 试运行' || '▶️ 实际执行' }}" >> $GITHUB_STEP_SUMMARY
           echo "- 强制同步: ${{ inputs.force_sync && '✅ 是' || '❌ 否' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 冲突策略: ${{ inputs.conflict_resolution || 'rename' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # 显示各个job的状态
@@ -725,7 +931,7 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "💾 **结果文件:**" >> $GITHUB_STEP_SUMMARY
             echo "- 可在 Artifacts 中下载 \`fork-sync-results\` 文件查看详细报告" >> $GITHUB_STEP_SUMMARY
-            echo "- 包含所有仓库的fork状态、链接和时间戳" >> $GITHUB_STEP_SUMMARY
+            echo "- 包含所有仓库的fork状态、重命名信息、链接和时间戳" >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️  **结果收集状态异常**" >> $GITHUB_STEP_SUMMARY
             echo "- 操作状态: ${{ needs.fork-sync.result }}" >> $GITHUB_STEP_SUMMARY
@@ -738,6 +944,13 @@ jobs:
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🆕 **新增自动重命名功能:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 智能检测重名冲突并自动重命名fork" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 多种命名策略：'-astrbot', '-fork', '-plugin', 'astrbot-' 前缀" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 数字后缀备选方案，确保找到可用名称" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 完整的重命名记录和统计信息" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 支持试运行模式预览重命名结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "🔄 **改进特性:**" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ 增加了重试机制（每个操作最多重试3次）" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ 添加了超时保护，避免长时间阻塞" >> $GITHUB_STEP_SUMMARY
@@ -745,8 +958,13 @@ jobs:
           echo "- ✅ 减少了批次大小和并发数，降低API压力" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ 增加了延迟时间，更好地避免rate limit" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "🔄 **下次运行建议:**" >> $GITHUB_STEP_SUMMARY
-          echo "- 使用试运行模式预览操作" >> $GITHUB_STEP_SUMMARY
-          echo "- 定期运行以保持fork同步" >> $GITHUB_STEP_SUMMARY
-          echo "- 检查失败的仓库并手动处理" >> $GITHUB_STEP_SUMMARY
-          echo "- 新的错误处理机制提高了稳定性" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **冲突策略说明:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏷️  **rename**: 自动重命名冲突的fork（推荐）" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏭️  **skip**: 跳过冲突的仓库" >> $GITHUB_STEP_SUMMARY
+          echo "- 🤔 **interactive**: 记录冲突待手动处理" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **使用建议:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 首次运行建议使用试运行模式预览结果" >> $GITHUB_STEP_SUMMARY
+          echo "- 推荐使用 'rename' 策略自动处理冲突" >> $GITHUB_STEP_SUMMARY
+          echo "- 定期运行以保持fork同步最新" >> $GITHUB_STEP_SUMMARY
+          echo "- 检查重命名的仓库，确保符合预期" >> $GITHUB_STEP_SUMMARY
