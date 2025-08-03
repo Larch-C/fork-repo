@@ -89,8 +89,8 @@ jobs:
           repos='${{ needs.prepare.outputs.repos }}'
           total_count=${{ needs.prepare.outputs.total_count }}
           
-          # 每批处理30个仓库（减少批次大小）
-          batch_size=50
+          # 每批处理100个仓库（减少批次大小）
+          batch_size=100
           batch_count=$(( (total_count + batch_size - 1) / batch_size ))
           
           echo "总仓库数: $total_count"
