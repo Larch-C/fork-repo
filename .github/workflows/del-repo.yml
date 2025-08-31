@@ -10,7 +10,7 @@ jobs:
       - name: Delete forked repos
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          USERNAME: your-username   # 改成你的用户名
+          USERNAME: Larch-c
         run: |
           page=1
           while true; do
