@@ -1,0 +1,35 @@
+name: Delete All Forked Repos
+
+on:
+  workflow_dispatch:  # 手动触发，不怕误删
+
+jobs:
+  delete-forks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete forked repos
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          USERNAME: your-username   # 改成你的用户名
+        run: |
+          page=1
+          while true; do
+            echo "Fetching page $page..."
+            repos=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/user/repos?per_page=100&page=$page" | jq -r '.[] | select(.fork==true) | .name')
+
+            # 如果这一页没有数据，就退出
+            if [ -z "$repos" ]; then
+              echo "No more forked repos found."
+              break
+            fi
+
+            for repo in $repos; do
+              echo "Deleting fork: $repo"
+              curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/$USERNAME/$repo" \
+                -o /dev/null -w "%{http_code}\n"
+            done
+
+            page=$((page+1))
+          done
